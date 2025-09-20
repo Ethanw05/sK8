@@ -1,0 +1,40 @@
+//Vertex Descriptor
+truct vertexDescriptorps3 {
+    int32_t m_refCount;     //Always 0?
+    uint32_t m_typesFlags;  //Denotes which element types are present, General formula is 1 << elementType for each element, combined with a bitwise OR.
+    uint16_t m_numStreams;  //Number of streams, Always 1? 
+    uint16_t m_numElements; //Number of elements, Maximum allowed is 16
+    uint16_t m_frequencyDividerOperation;   //Frequency divider operation for each element, One bit per element. See operation Always modulo ?
+    uint16_t m_pad0;        //Padding
+};
+
+struct VertexDescriptorElementps3 {
+    uint8_t    vertexType;     //Datatype of each coordinate
+    uint8_t    numComponents;  //Number of components
+    uint8_t    stream;         //Stream index
+    uint8_t    offset;         //Starting offset of the vertex attribute array
+    uint16_t stride;        //Offset bytes between consecutive vertices    
+    uint8_t    type;           //Element type
+    uint8_t    elementClass;   //Element class
+};
+
+
+
+
+
+//Element Type
+std::unordered_map<uint8_t, std::string> d3ddeclUsage = {
+    {0x00, "D3DDECLUSAGE_POSITION"},        //Position data.
+    {0x01, "D3DDECLUSAGE_BLENDWEIGHT"},        //Blending weight data.
+    {0x02, "D3DDECLUSAGE_BLENDINDICES"},    //Blending indices data.
+    {0x03, "D3DDECLUSAGE_NORMAL"},            //Vertex normal data.
+    {0x04, "D3DDECLUSAGE_PSIZE"},            //Point size data.
+    {0x05, "D3DDECLUSAGE_TEXCOORD"},        //Texture coordinate data.
+    {0x06, "D3DDECLUSAGE_TANGENT"},            //Vertex tangent data.
+    {0x07, "D3DDECLUSAGE_BINORMAL"},        //Vertex binormal data.
+    {0x08, "D3DDECLUSAGE_TESSFACTOR"},      //Single positive floating - point value.Use D3DDECLUSAGE_TESSFACTOR with a usage index of 0 to specify a tessellation factor used in the tessellation unit to control the rate of tessellation.
+    {0x0A, "D3DDECLUSAGE_COLOR"},            //Vertex data contains diffuse or specular color.
+    {0x0B, "D3DDECLUSAGE_FOG"},                //Vertex data contains fog data.
+    {0x0C, "D3DDECLUSAGE_DEPTH"},            //Vertex data contains depth data.
+    {0x0D, "D3DDECLUSAGE_SAMPLE"},            //Vertex data contains sampler data.
+};
