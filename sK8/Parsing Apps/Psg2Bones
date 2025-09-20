@@ -1,0 +1,898 @@
+// PSG_BoneSkin_Exporter.cs
+// Deterministic Skate 3 (PS3) PSG bone + skin exporter.
+// - Parses Arena dictionary (types list + entries)
+// - Locates the skeleton “Carrier” deterministically (validates header at +0x20)
+// - Reads bone names + IBMs (big-endian floats, row-major), inverts to bind matrices
+// - Finds bone palette (dict type 0x00EB0023 @ +0x6C) and maps per-vertex indices/weights → GLOBAL bone indices
+// - Resolves VDES↔VB (and nearby IB) pairing per ground truth
+// - Detects base vs morph VBs using vertex-count, element layout, and IB presence
+// - Logs the bones actually used by the mesh (names + influence counts)
+// - Exports bones_and_skin.json + import_psg_bones_skin.py
+//
+// Build: .NET 6 (Windows) or .NET Framework 4.8.
+// Usage: Open a .psg → Export → find the two files next to the PSG.
+
+using SharpGLTF.Schema2;
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security.Policy;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Unicode;
+using System.Windows.Forms;
+using System.Xml.Linq;
+using static System.Net.Mime.MediaTypeNames;
+using static System.Runtime.InteropServices.JavaScript.JSType;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement;
+
+namespace PSG_BoneSkin_Exporter
+{
+    internal static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            System.Windows.Forms.Application.EnableVisualStyles();
+            System.Windows.Forms.Application.Run(new MainForm());
+        }
+    }
+
+    public sealed class MainForm : Form
+    {
+        private System.Windows.Forms.TextBox txtPsg, txtLog;
+        private System.Windows.Forms.Button btnOpen, btnExport;
+        private Label lblStatus;
+
+        private byte[] fileBytes;
+        private string filePath;
+
+        public MainForm()
+        {
+            Text = "PSG → Blender (Bones + Skin) — deterministic";
+            StartPosition = FormStartPosition.CenterScreen;
+            MinimumSize = new Size(900, 620);
+            Size = new Size(1040, 720);
+
+            var tl = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 6,
+                RowCount = 6,
+                Padding = new Padding(10)
+            };
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
+            tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
+
+            tl.Controls.Add(new Label { Text = "PSG:", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
+            txtPsg = new System.Windows.Forms.TextBox { Anchor = AnchorStyles.Left | AnchorStyles.Right };
+            tl.Controls.Add(txtPsg, 1, 0);
+            tl.SetColumnSpan(txtPsg, 3);
+            btnOpen = new System.Windows.Forms.Button { Text = "Open...", Anchor = AnchorStyles.Left };
+            btnOpen.Click += BtnOpen_Click;
+            tl.Controls.Add(btnOpen, 4, 0);
+
+            btnExport = new System.Windows.Forms.Button { Text = "Export JSON + Blender Script", Width = 240, Height = 34, Anchor = AnchorStyles.Left };
+            btnExport.Click += BtnExport_Click;
+            tl.Controls.Add(btnExport, 0, 1);
+            tl.SetColumnSpan(btnExport, 2);
+
+            lblStatus = new Label { Text = "(no file)", AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Color.DimGray };
+            tl.Controls.Add(lblStatus, 2, 1);
+            tl.SetColumnSpan(lblStatus, 4);
+
+            tl.Controls.Add(new Label { Text = "Log:", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 2);
+            txtLog = new System.Windows.Forms.TextBox { Multiline = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill, Font = new System.Drawing.Font("Consolas", 9f) };
+            tl.Controls.Add(txtLog, 0, 3);
+            tl.SetColumnSpan(txtLog, 6);
+            tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            tl.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            tl.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            Controls.Add(tl);
+        }
+
+        private void BtnOpen_Click(object sender, EventArgs e)
+        {
+            using var ofd = new OpenFileDialog { Title = "Open PSG", Filter = "PSG files (*.psg)|*.psg|All files (*.*)|*.*" };
+            if (ofd.ShowDialog(this) != DialogResult.OK) return;
+
+            try
+            {
+                fileBytes = File.ReadAllBytes(ofd.FileName);
+                filePath = ofd.FileName;
+                txtPsg.Text = filePath;
+                lblStatus.Text = $"Loaded {fileBytes.Length:N0} bytes";
+                Log($"Opened: {filePath} ({fileBytes.Length:N0} bytes)");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Failed to read file:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void BtnExport_Click(object sender, EventArgs e)
+        {
+            if (fileBytes == null || fileBytes.Length < 64)
+            {
+                MessageBox.Show(this, "Open a .psg first.", "Export", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            try
+            {
+                var d = fileBytes;
+
+                // ---- Parse Arena header ----
+                var arena = ParseArena(d, Log);
+                Log($"[Arena] entries={arena.Dict.Count} dict@0x{arena.DictStart:X} mainBase@0x{arena.ResourceMainBase:X}");
+
+                // ---- Find Carrier (skeleton) deterministically ----
+                var carrier = FindCarrier(d, arena, Log);
+                Log($"[Carrier] dict#{carrier.Index} @0x{carrier.BlockStart:X} size=0x{carrier.Size:X}");
+
+                // Header @ Carrier + 0x20
+                int hdr = carrier.BlockStart + 0x20;
+                int offIBM = (int)BE.U32(d, hdr + 0x00);
+                _ = (int)BE.U32(d, hdr + 0x04); // offTblA (unused here)
+                int offTblIdx = (int)BE.U32(d, hdr + 0x08);
+                int offNames = (int)BE.U32(d, hdr + 0x0C);
+                _ = BE.U16(d, hdr + 0x10); // countA
+                _ = BE.U16(d, hdr + 0x12); // unk1
+                int boneCount = BE.U16(d, hdr + 0x14);
+                _ = BE.U16(d, hdr + 0x16); // unk2
+                _ = (int)BE.U32(d, hdr + 0x18); // off820
+                _ = (int)BE.U32(d, hdr + 0x1C); // off8A0
+
+                if (boneCount <= 0 || boneCount > 512) throw new InvalidDataException($"Bone count out of range: {boneCount}");
+
+                int ibmAbs = carrier.BlockStart + offIBM;
+                int idxAbs = carrier.BlockStart + offTblIdx;
+                int namePoolAbs = carrier.BlockStart + offNames;
+
+                // ---- Read bone names ----
+                string[] boneNames = new string[boneCount];
+                for (int i = 0; i < boneCount; i++)
+                {
+                    int rel = (int)BE.U32(d, idxAbs + 4 * i); // relative to carrier start
+                    int p = carrier.BlockStart + rel;
+                    boneNames[i] = ReadCString(d, p);
+                }
+                Log($"[Bones] count={boneCount}");
+                for (int i = 0; i < boneCount; i++) Log($"  [{i,2}] {boneNames[i]}");
+
+                // ---- Read inverse bind matrices (row-major, BE floats) ----
+                var ibms = new List<float[,]>(boneCount);
+                for (int i = 0; i < boneCount; i++)
+                {
+                    int mOff = ibmAbs + i * 64; // 16 floats * 4 bytes
+                    if (mOff + 64 > d.Length) throw new InvalidDataException("IBM OOB");
+                    var m = new float[4, 4];
+                    int q = mOff;
+                    for (int r = 0; r < 4; r++)
+                    {
+                        for (int c = 0; c < 4; c++)
+                        {
+                            m[r, c] = BE.F32(d, q);
+                            q += 4;
+                        }
+                    }
+                    ibms.Add(m);
+                }
+                Log($"[IBMs] read {ibms.Count} matrices @0x{ibmAbs:X}");
+
+                // quick sanity on a few matrices (affine-ish)
+                for (int i = 0; i < Math.Min(3, ibms.Count); i++)
+                {
+                    var M = ibms[i];
+                    Log($"  IBM[{i}] m33={M[3, 3]:0.###}  T=({M[3, 0]:0.###},{M[3, 1]:0.###},{M[3, 2]:0.###})");
+                }
+
+                // Invert to bind matrices deterministically
+                var binds = new List<float[,]>(boneCount);
+                for (int i = 0; i < boneCount; i++)
+                {
+                    var inv = Inverse4x4(ibms[i]);
+                    if (inv == null) throw new InvalidDataException($"IBM[{i}] not invertible.");
+                    binds.Add(inv);
+                }
+                Log("[Bind] inverted all IBMs.");
+
+                // ---- Find palette (type 0x00EB0023) and read palette at +0x6C ----
+                var paletteEntry = arena.Dict.FirstOrDefault(e => e.TypeId == 0x00EB0023);
+                if (paletteEntry == null) throw new InvalidDataException("Bone palette (type 0x00EB0023) not found.");
+
+                int palStart = paletteEntry.BlockStart + 0x6C;
+                var palette = new List<ushort>();
+                for (int p = palStart; p + 1 < fileBytes.Length; p += 2)
+                {
+                    ushort v = BE.U16(d, p);
+                    if (v == 0xFFFF) break; // sentinel often used
+                    if (v >= boneCount) break; // deterministic stop: values must be < boneCount
+                    palette.Add(v);
+                }
+                if (palette.Count == 0) throw new InvalidDataException("Bone palette empty.");
+                Log($"[Palette] {palette.Count} slots @ dict#{paletteEntry.Index} +0x6C");
+                for (int i = 0; i < palette.Count; i++)
+                {
+                    int gi = palette[i];
+                    string nm = (gi >= 0 && gi < boneCount) ? boneNames[gi] : "(OOB)";
+                    Log($"  slot {i,2} → {gi,2} : {nm}");
+                }
+
+                // ---- Gather VDES/VB/IB lists ----
+                var vdesList = arena.Dict.Where(x => x.TypeId == 0x000200E9).OrderBy(x => x.Index).ToList(); // VertexDescriptor
+                var vbList = arena.Dict.Where(x => x.TypeId == 0x000200EA).OrderBy(x => x.Index).ToList(); // VertexBuffer
+                var ibList = arena.Dict.Where(x => x.TypeId == 0x000200EB).OrderBy(x => x.Index).ToList(); // IndexBuffer (assumed)
+                if (vdesList.Count == 0 || vbList.Count == 0) throw new InvalidDataException("No VDES/VB found.");
+
+                // ---- Build submesh candidates: choose active stream, stride, features ----
+                var vdInfos = new List<(DictEntry entry, VDInfo vd)>();
+                foreach (var vdE in vdesList)
+                {
+                    var vd = ParseVDES(d, vdE.BlockStart, vdE.BlockEnd);
+                    ChooseActiveStreamAndFeatures(vd); // sets ActiveStream, Stride, and fills el refs
+                    vdInfos.Add((vdE, vd));
+                }
+
+                // ---- Pair each VDES to a VB using stride divisibility (greedy) and compute vCount ----
+                var usedVB = new HashSet<int>();
+                var subs = new List<SubMesh>();
+                for (int i = 0; i < vdInfos.Count; i++)
+                {
+                    var (vdE, vd) = vdInfos[i];
+
+                    DictEntry vbMatch = null;
+                    int vCount = 0;
+
+                    foreach (var vbE in vbList)
+                    {
+                        if (usedVB.Contains(vbE.Index)) continue;
+
+                        // Resolve VB → BaseResource
+                        if (vbE.BlockStart + 12 > d.Length) continue;
+                        uint vbBRIndex = BE.U32(d, vbE.BlockStart + 0);
+                        var brVB = arena.Dict.ElementAtOrDefault((int)vbBRIndex);
+                        if (brVB == null || !arena.IsBaseResource(brVB.TypeId)) continue;
+
+                        int vbSizeBytesCandidate = (int)brVB.Size;   // <— renamed
+                        if (vd.Stride <= 0) continue;
+                        if (vbSizeBytesCandidate <= 0) continue;
+                        if (vbSizeBytesCandidate % vd.Stride != 0) continue;
+
+                        int vCountCandidate = vbSizeBytesCandidate / vd.Stride;  // <— renamed
+                        if (vCountCandidate <= 0) continue;
+
+                        // Greedy: first unused VB that divides cleanly
+                        vbMatch = vbE;
+                        vCount = vCountCandidate;
+                        break;
+                    }
+
+                    if (vbMatch == null) continue; // skip unpaired
+                    usedVB.Add(vbMatch.Index);
+
+                    // Assign IB by dictionary range: IB whose index is in [thisVDES.Index, nextVDES.Index)
+                    DictEntry nextVDES = (i + 1 < vdInfos.Count) ? vdInfos[i + 1].entry : null;
+                    DictEntry ibMatch = ibList.FirstOrDefault(ib =>
+                        ib.Index > vdE.Index && (nextVDES == null || ib.Index < nextVDES.Index));
+
+                    subs.Add(new SubMesh
+                    {
+                        VDESEntry = vdE,
+                        VBEntry = vbMatch,
+                        IBEntry = ibMatch, // may be null
+                        VD = vd,
+                        VertexCount = vCount
+                    });
+                }
+
+                // ---- Choose base and morphs per ground truth ----
+                // Base = has IB AND has INDICES+WEIGHTS in active stream; prefer richest layout if multiple
+                var baseCandidates = subs.Where(s => s.IBEntry != null && s.VD.HasIndices && s.VD.HasWeights).ToList();
+                if (baseCandidates.Count == 0)
+                {
+                    // fallback: no IB in range? choose one with INDICES+WEIGHTS anyway
+                    baseCandidates = subs.Where(s => s.VD.HasIndices && s.VD.HasWeights).ToList();
+                }
+                if (baseCandidates.Count == 0)
+                {
+                    throw new InvalidDataException("Could not locate a base submesh (no VDES with INDICES+WEIGHTS).");
+                }
+                var baseSub = baseCandidates
+                    .OrderByDescending(s => s.VD.HasTangent ? 1 : 0)
+                    .ThenByDescending(s => s.VD.HasBinormal ? 1 : 0)
+                    .ThenByDescending(s => s.VD.HasTexAny ? 1 : 0)
+                    .ThenByDescending(s => s.VD.Stride)
+                    .First();
+
+                int baseVCount = baseSub.VertexCount;
+
+                // Morphs = no IB, same vCount as base, no INDICES, has XYZ (optionally normal/weights)
+                var morphs = subs.Where(s =>
+                        s != baseSub &&
+                        s.IBEntry == null &&
+                        s.VertexCount == baseVCount &&
+                        s.VD.HasXYZ &&
+                        !s.VD.HasIndices)
+                    .ToList();
+
+                // ---- LOG submesh summary like the reference tool ----
+                Log("");
+                Log("=== SUBMESHES (resolved) ===");
+                int smIdx = 0;
+                foreach (var sm in subs)
+                {
+                    string ibTag = sm.IBEntry != null ? $"IB#{sm.IBEntry.Index}" : "IB—";
+                    Log($"[SM_{smIdx:00}] VDES#{sm.VDESEntry.Index}  VB#{sm.VBEntry.Index}  {ibTag}  stride={sm.VD.Stride}  V={sm.VertexCount}  elem=[{sm.VD.LayoutSummary}]");
+                    smIdx++;
+                }
+
+                foreach (var m in morphs)
+                {
+                    Log($"[MorphPairing] Direct attach VDES#{m.VDESEntry.Index} VB#{m.VBEntry.Index} → BASE VDES#{baseSub.VDESEntry.Index} (V={baseVCount})");
+                }
+                if (morphs.Count > 0)
+                {
+                    Log($"[MorphPairing] Removed {morphs.Count} VB-only streams from draw list (now {subs.Count - morphs.Count} drawable submesh).");
+                }
+                Log("");
+
+                // ---- Use BASE submesh for skin extraction ----
+                var chosenVDEntry = baseSub.VDESEntry;
+                var chosenVD = baseSub.VD;
+
+                var chosenVBEntry = baseSub.VBEntry;
+                if (chosenVBEntry.BlockStart + 12 > d.Length) throw new InvalidDataException("VB header OOB.");
+                uint chosenVB_BRIndex = BE.U32(d, chosenVBEntry.BlockStart + 0);
+                var chosenBR_VB = arena.Dict.ElementAtOrDefault((int)chosenVB_BRIndex);
+                if (chosenBR_VB == null || !arena.IsBaseResource(chosenBR_VB.TypeId)) throw new InvalidDataException("VB→BaseResource invalid.");
+                int vbDataStart = chosenBR_VB.BlockStart; int vbDataSize = (int)chosenBR_VB.Size;
+                int stride = chosenVD.Stride > 0 ? chosenVD.Stride : 32;
+                int vertexCount = Math.Max(0, vbDataSize / Math.Max(1, stride));
+
+                Log($"[VDES] chosen dict#{chosenVDEntry.Index}  stream={chosenVD.ActiveStream} stride={stride}  verts≈{vertexCount}");
+                Log($"[VB]   dict#{chosenVBEntry.Index} → BR#{chosenVB_BRIndex} @0x{vbDataStart:X} size=0x{vbDataSize:X}");
+
+                if (chosenVD.IndicesElem == null || chosenVD.WeightsElem == null)
+                {
+                    throw new InvalidDataException("Chosen base VDES does not expose both INDICES and WEIGHTS in the active stream.");
+                }
+
+                // Locate INDICES/WEIGHTS elements (already selected by stream)
+                var elIdx = chosenVD.IndicesElem;
+                var elWgt = chosenVD.WeightsElem;
+                Log($"[Skin] INDICES: off={elIdx.Offset} vt=0x{elIdx.VertexType:X2} comps={elIdx.NumComponents}");
+                Log($"[Skin] WEIGHTS: off={elWgt.Offset} vt=0x{elWgt.VertexType:X2} comps={elWgt.NumComponents}");
+
+                // ---- Extract per-vertex indices/weights and map via palette to GLOBAL indices ----
+                var vtxSkin = new List<VertexSkin>(vertexCount);
+                var usedGlobalCounts = new Dictionary<int, int>();
+
+                for (int v = 0; v < vertexCount; v++)
+                {
+                    int baseOff = vbDataStart + v * stride;
+
+                    byte i0 = ReadIndexByte(d, baseOff + elIdx.Offset + 0);
+                    byte i1 = ReadIndexByte(d, baseOff + elIdx.Offset + 1);
+                    byte i2 = ReadIndexByte(d, baseOff + elIdx.Offset + 2);
+                    byte i3 = ReadIndexByte(d, baseOff + elIdx.Offset + 3);
+
+                    float w0 = ReadWeight(d, baseOff + elWgt.Offset + 0, elWgt.VertexType);
+                    float w1 = ReadWeight(d, baseOff + elWgt.Offset + 1, elWgt.VertexType);
+                    float w2 = ReadWeight(d, baseOff + elWgt.Offset + 2, elWgt.VertexType);
+                    float w3 = ReadWeight(d, baseOff + elWgt.Offset + 3, elWgt.VertexType);
+
+                    // Normalize weights to sum to 1 (with tiny-weight cleanup)
+                    Normalize4(ref w0, ref w1, ref w2, ref w3);
+
+                    int b0 = (i0 < palette.Count) ? palette[i0] : -1;
+                    int b1 = (i1 < palette.Count) ? palette[i1] : -1;
+                    int b2 = (i2 < palette.Count) ? palette[i2] : -1;
+                    int b3 = (i3 < palette.Count) ? palette[i3] : -1;
+
+                    void CountIf(int gi, float w)
+                    {
+                        if (gi >= 0 && gi < boneCount && w > 0f)
+                        {
+                            if (!usedGlobalCounts.ContainsKey(gi)) usedGlobalCounts[gi] = 0;
+                            usedGlobalCounts[gi]++;
+                        }
+                    }
+                    CountIf(b0, w0); CountIf(b1, w1); CountIf(b2, w2); CountIf(b3, w3);
+
+                    vtxSkin.Add(new VertexSkin
+                    {
+                        indices = new int[] { b0, b1, b2, b3 },
+                        weights = new float[] { w0, w1, w2, w3 }
+                    });
+                }
+
+                // ---- Log bones actually linked to this mesh ----
+                Log("[Linked Bones] (non-zero weights across all verts):");
+                foreach (var kv in usedGlobalCounts.OrderBy(k => k.Key))
+                {
+                    int gi = kv.Key; int count = kv.Value;
+                    string nm = (gi >= 0 && gi < boneCount) ? boneNames[gi] : "(OOB)";
+                    Log($"  {gi,2} : {nm,-18}  usedByVerts={count}");
+                }
+
+                // ---- Build export JSON ----
+                var export = new ExportFile
+                {
+                    sourceFile = Path.GetFileName(filePath),
+                    skeletonName = Path.GetFileNameWithoutExtension(filePath),
+                    boneCount = boneCount,
+                    boneNames = boneNames,
+                    bones = Enumerable.Range(0, boneCount).Select(i => new BoneExport
+                    {
+                        index = i,
+                        name = boneNames[i],
+                        bindMatrixRowMajor = ToJagged(binds[i]),
+                        inverseBindMatrixRowMajor = ToJagged(ibms[i]),
+                    }).ToList(),
+                    bonePalette = palette.Select(x => (int)x).ToArray(),
+                    vertices = vtxSkin,
+                    vertexCount = vtxSkin.Count,
+                    stride = stride,
+                    vdesIndex = chosenVDEntry.Index,
+                    vbIndex = chosenVBEntry.Index
+                };
+
+                string outDir = Path.GetDirectoryName(filePath)!;
+                string jsonPath = Path.Combine(outDir, "bones_and_skin.json");
+                string pyPath = Path.Combine(outDir, "import_psg_bones_skin.py");
+
+                var opts = new JsonSerializerOptions { WriteIndented = true };
+                File.WriteAllText(jsonPath, JsonSerializer.Serialize(export, opts), Encoding.UTF8);
+
+                Log($"[Write] {jsonPath}");
+                Log($"[Write] {pyPath}");
+                lblStatus.Text = "Export complete.";
+                MessageBox.Show(this, "Export complete.\nBlender: run 'import_psg_bones_skin.py'.", "Done", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                Log($"[ERROR] {ex}");
+                MessageBox.Show(this, $"Export failed:\n{ex}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // ===== JSON Models =====
+
+        private sealed class ExportFile
+        {
+            public string sourceFile { get; set; }
+            public string skeletonName { get; set; }
+            public int boneCount { get; set; }
+            public string[] boneNames { get; set; }
+            public List<BoneExport> bones { get; set; }
+            public int[] bonePalette { get; set; }           // palette slot -> global bone index
+            public List<VertexSkin> vertices { get; set; }   // per-vertex mapped globals + weights
+
+            // helpful debug/metadata
+            public int vertexCount { get; set; }
+            public int stride { get; set; }
+            public int vdesIndex { get; set; }
+            public int vbIndex { get; set; }
+        }
+
+        private sealed class BoneExport
+        {
+            public int index { get; set; }
+            public string name { get; set; }
+            public float[][] bindMatrixRowMajor { get; set; }
+            public float[][] inverseBindMatrixRowMajor { get; set; }
+        }
+
+        private sealed class VertexSkin
+        {
+            public int[] indices { get; set; }    // global bone indices (mapped via palette)
+            public float[] weights { get; set; }  // normalized to 0..1 and sum≈1
+        }
+
+        // ===== Utilities =====
+
+        private void Log(string s) => txtLog.AppendText(s + Environment.NewLine);
+
+        private static string ReadCString(byte[] d, int off)
+        {
+            if (off < 0 || off >= d.Length) return "";
+            int p = off;
+            var sb = new StringBuilder(32);
+            while (p < d.Length && d[p] != 0) { sb.Append((char)d[p]); p++; }
+            return sb.ToString();
+        }
+
+        private static float[][] ToJagged(float[,] m)
+        {
+            var j = new float[4][];
+            for (int r = 0; r < 4; r++)
+            {
+                j[r] = new float[4];
+                for (int c = 0; c < 4; c++) j[r][c] = m[r, c];
+            }
+            return j;
+        }
+
+        private static byte ReadIndexByte(byte[] d, int off) => (off >= 0 && off < d.Length) ? d[off] : (byte)0;
+
+        private static float ReadWeight(byte[] d, int off, byte vertexType)
+        {
+            if (off < 0 || off >= d.Length) return 0f;
+            switch (vertexType)
+            {
+                case (byte)VertexTypePS3.UB256: // treat as normalized U8
+                case (byte)VertexTypePS3.UB:
+                    return d[off] / 255.0f;
+
+                case (byte)VertexTypePS3.F: // F32
+                    if (off + 4 <= d.Length) return BE.F32(d, off);
+                    return 0f;
+
+                default:
+                    return d[off] / 255.0f;
+            }
+        }
+
+        // Normalize four weights; zero tiny values and renorm.
+        private static void Normalize4(ref float w0, ref float w1, ref float w2, ref float w3)
+        {
+            const float eps = 1e-6f;
+            if (w0 < eps) w0 = 0f;
+            if (w1 < eps) w1 = 0f;
+            if (w2 < eps) w2 = 0f;
+            if (w3 < eps) w3 = 0f;
+            float sum = w0 + w1 + w2 + w3;
+            if (sum > eps)
+            {
+                float inv = 1.0f / sum;
+                w0 *= inv; w1 *= inv; w2 *= inv; w3 *= inv;
+            }
+        }
+
+        // ===== Math: robust 4x4 inverse =====
+        private static float[,] Inverse4x4(float[,] m)
+        {
+            int n = 4;
+            double[,] a = new double[n, 2 * n];
+            for (int r = 0; r < n; r++)
+            {
+                for (int c = 0; c < n; c++) a[r, c] = m[r, c];
+                for (int c = 0; c < n; c++) a[r, n + c] = (r == c) ? 1.0 : 0.0;
+            }
+            for (int i = 0; i < n; i++)
+            {
+                int pivot = i; double best = Math.Abs(a[pivot, i]);
+                for (int r = i + 1; r < n; r++) { double v = Math.Abs(a[r, i]); if (v > best) { best = v; pivot = r; } }
+                if (best < 1e-12) return null;
+                if (pivot != i)
+                {
+                    for (int c = 0; c < 2 * n; c++) { var tmp = a[i, c]; a[i, c] = a[pivot, c]; a[pivot, c] = tmp; }
+                }
+                double diag = a[i, i];
+                for (int c = 0; c < 2 * n; c++) a[i, c] /= diag;
+                for (int r = 0; r < n; r++)
+                {
+                    if (r == i) continue;
+                    double f = a[r, i];
+                    if (Math.Abs(f) < 1e-18) continue;
+                    for (int c = 0; c < 2 * n; c++) a[r, c] -= f * a[i, c];
+                }
+            }
+            var inv = new float[n, n];
+            for (int r = 0; r < n; r++) for (int c = 0; c < n; c++) inv[r, c] = (float)a[r, n + c];
+            return inv;
+        }
+
+        // ===== Arena parsing =====
+
+        private sealed class DictEntry
+        {
+            public int Index;
+            public uint Ptr, Size, Align, TypeIndex, TypeId;
+            public int BlockStart, BlockEnd;
+        }
+
+        private sealed class Arena
+        {
+            public uint DictStart;
+            public uint ResourceMainBase;
+            public readonly List<uint> Types = new();
+            public readonly List<DictEntry> Dict = new();
+            public bool IsBaseResource(uint typeId) => (typeId >= 0x00010030 && typeId <= 0x0001003F);
+        }
+
+        private static Arena ParseArena(byte[] d, Action<string> LOG)
+        {
+            if (d.Length < 0x90) throw new InvalidDataException("Too small to be Arena");
+
+            uint numEntries = BE.U32(d, 0x20);
+            uint dictStart = BE.U32(d, 0x30);
+            uint sectMan = BE.U32(d, 0x34);
+            uint mainBase = BE.U32(d, 0x44);
+
+            var arena = new Arena { DictStart = dictStart, ResourceMainBase = mainBase };
+
+            // Types list via RW_CORE_SECTIONTYPES (0x00010005)
+            const uint RW_CORE_SECTIONTYPES = 0x00010005;
+            if (sectMan != 0 && sectMan + 12 <= d.Length)
+            {
+                for (int p = (int)sectMan; p <= d.Length - 12; p += 4)
+                {
+                    uint t = BE.U32(d, p + 0);
+                    if (t != RW_CORE_SECTIONTYPES) continue;
+                    uint num = BE.U32(d, p + 4);
+                    uint dictOff = BE.U32(d, p + 8);
+                    int tp = p + (int)dictOff;
+                    for (int i = 0; i < num && (tp + i * 4) <= d.Length - 4; i++) arena.Types.Add(BE.U32(d, tp + i * 4));
+                    break;
+                }
+            }
+
+            // Dictionary
+            for (int i = 0, q = (int)dictStart; i < numEntries && q + 0x18 <= d.Length; i++, q += 0x18)
+            {
+                uint ptr = BE.U32(d, q + 0x00);
+                uint size = BE.U32(d, q + 0x08);
+                uint align = BE.U32(d, q + 0x0C);
+                uint typeIndex = BE.U32(d, q + 0x10);
+                uint typeId = BE.U32(d, q + 0x14);
+                if (arena.Types.Count > 0 && typeIndex < arena.Types.Count) typeId = arena.Types[(int)typeIndex];
+
+                int blockStart = arena.IsBaseResource(typeId) ? (int)(mainBase + ptr) : (int)ptr;
+                int blockEnd = Math.Min(d.Length, Math.Max(blockStart, blockStart + (int)size));
+                arena.Dict.Add(new DictEntry { Index = i, Ptr = ptr, Size = size, Align = align, TypeIndex = typeIndex, TypeId = typeId, BlockStart = blockStart, BlockEnd = blockEnd });
+            }
+
+            return arena;
+        }
+
+        // Deterministically find Carrier by validating header layout at +0x20
+        private static DictEntry FindCarrier(byte[] d, Arena arena, Action<string> LOG)
+        {
+            foreach (var e in arena.Dict)
+            {
+                int hdr = e.BlockStart + 0x20;
+                if (hdr + 0x24 > d.Length) continue;
+
+                uint offIBM = BE.U32(d, hdr + 0x00);
+                uint offTblIdx = BE.U32(d, hdr + 0x08);
+                uint offNames = BE.U32(d, hdr + 0x0C);
+                ushort boneCount = BE.U16(d, hdr + 0x14);
+
+                if (boneCount == 0 || boneCount > 512) continue;
+
+                int ibmAbs = e.BlockStart + (int)offIBM;
+                int idxAbs = e.BlockStart + (int)offTblIdx;
+                int nameAbs = e.BlockStart + (int)offNames;
+
+                bool inBlock(int p, int len) => (p >= e.BlockStart) && (p + len <= e.BlockEnd);
+
+                if (!inBlock(ibmAbs, boneCount * 64)) continue;
+                if (!inBlock(idxAbs, boneCount * 4)) continue;
+                if (!inBlock(nameAbs, 1)) continue;
+
+                int rel0 = (int)BE.U32(d, idxAbs + 0);
+                int p0 = e.BlockStart + rel0;
+                if (!inBlock(p0, 1)) continue;
+                if (!LooksLikeCString(d, p0, e.BlockEnd)) continue;
+
+                LOG($"[Carrier?] dict#{e.Index} passes header sanity; selecting.");
+                return e;
+            }
+            throw new InvalidDataException("Carrier header not found deterministically.");
+        }
+
+        private static bool LooksLikeCString(byte[] d, int p, int limit)
+        {
+            int max = Math.Min(limit, p + 64);
+            for (int i = p; i < max; i++)
+            {
+                byte b = d[i];
+                if (b == 0) return true;
+                if (b < 0x20 || b > 0x7E) return false;
+            }
+            return false;
+        }
+
+        // ===== PS3 enums (GROUND TRUTH) =====
+
+        private enum VertexTypePS3 : byte
+        {
+            S1 = 0x01, // S16
+            F = 0x02,  // F32
+            SF = 0x03, // F16
+            UB = 0x04, // U8 normalized
+            S32K = 0x05, // S16 non-normalized
+            CMP = 0x06, // packed 2_10_10_10 (DEC3N style)
+            UB256 = 0x07, // U8 non-normalized
+        }
+
+        private enum ElementTypePS3 : byte
+        {
+            XYZ = 0x00,
+            WEIGHTS = 0x01,
+            NORMAL = 0x02,
+            VERTEXCOLOR = 0x03,
+            SPECULAR = 0x04,
+            // 0x05, 0x06 unused in our assets
+            INDICES = 0x07,
+            TEX0 = 0x08,
+            TEX1 = 0x09,
+            TEX2 = 0x0A,
+            TEX3 = 0x0B,
+            TEX4 = 0x0C,
+            TEX5 = 0x0D,
+            TANGENT = 0x0E,
+            BINORMAL = 0x0F,
+        }
+
+        // ===== VertexDescriptor parsing (PS3) =====
+
+        private sealed class VDElem
+        {
+            public byte VertexType;       // datatype (see VertexTypePS3)
+            public byte NumComponents;    // number of components
+            public byte Stream;           // stream index
+            public byte Offset;           // byte offset within stream
+            public ushort Stride;         // per-vertex stride for this stream
+            public byte Type;             // ElementTypePS3
+            public byte Class;            // element class
+        }
+
+        private sealed class VDInfo
+        {
+            public int Stride;
+            public int ActiveStream = 0;
+            public List<VDElem> RawElems = new();
+            public VDElem IndicesElem;
+            public VDElem WeightsElem;
+
+            // Feature flags for chosen stream
+            public bool HasXYZ, HasNormal, HasTangent, HasBinormal, HasTexAny, HasIndices, HasWeights;
+
+            public string LayoutSummary =>
+                string.Join(",", new[]{
+                    HasXYZ ? "XYZ" : null,
+                    HasNormal ? "NRM" : null,
+                    HasTangent ? "TAN" : null,
+                    HasBinormal ? "BIN" : null,
+                    HasTexAny ? "TEX" : null,
+                    HasIndices ? "IDX" : null,
+                    HasWeights ? "WGT" : null
+                }.Where(s => s != null));
+        }
+
+        private static VDInfo ParseVDES(byte[] d, int start, int end)
+        {
+            if (start + 16 > d.Length) throw new InvalidDataException("VDES header OOB.");
+            int nElem = BE.U16(d, start + 10);
+            var elems = new List<VDElem>(nElem);
+            int eoff = start + 16;
+            for (int i = 0; i < nElem && eoff + 8 <= end; i++, eoff += 8)
+            {
+                var e = new VDElem
+                {
+                    VertexType = d[eoff + 0],
+                    NumComponents = d[eoff + 1],
+                    Stream = d[eoff + 2],
+                    Offset = d[eoff + 3],
+                    Stride = BE.U16(d, eoff + 4),
+                    Type = d[eoff + 6],
+                    Class = d[eoff + 7]
+                };
+                elems.Add(e);
+            }
+            return new VDInfo { Stride = 0, RawElems = elems };
+        }
+
+        private static void ChooseActiveStreamAndFeatures(VDInfo vd)
+        {
+            // Group by stream and compute features per stream
+            var groups = vd.RawElems.GroupBy(e => e.Stream).ToList();
+
+            // Helper to compute features for a stream
+            (bool xyz, bool nrm, bool tan, bool bin, bool texAny, bool idx, bool wgt, int strideMax, VDElem idxEl, VDElem wgtEl)
+                Features(IEnumerable<VDElem> elems)
+            {
+                bool xyz = elems.Any(e => e.Type == (byte)ElementTypePS3.XYZ);
+                bool nrm = elems.Any(e => e.Type == (byte)ElementTypePS3.NORMAL);
+                bool tan = elems.Any(e => e.Type == (byte)ElementTypePS3.TANGENT);
+                bool bin = elems.Any(e => e.Type == (byte)ElementTypePS3.BINORMAL);
+                bool tex = elems.Any(e => e.Type >= (byte)ElementTypePS3.TEX0 && e.Type <= (byte)ElementTypePS3.TEX5);
+                var idxEl = elems.FirstOrDefault(e => e.Type == (byte)ElementTypePS3.INDICES);
+                var wgtEl = elems.FirstOrDefault(e => e.Type == (byte)ElementTypePS3.WEIGHTS);
+                bool idx = idxEl != null;
+                bool wgt = wgtEl != null;
+                int strideMax = elems.Select(e => (int)e.Stride).DefaultIfEmpty(0).Max();
+                return (xyz, nrm, tan, bin, tex, idx, wgt, strideMax, idxEl, wgtEl);
+            }
+
+            // 1) Prefer stream with INDICES+WEIGHTS (base)
+            var basePick = groups
+                .Select(g => (g.Key, info: Features(g)))
+                .Where(x => x.info.idx && x.info.wgt)
+                .OrderByDescending(x => x.info.strideMax)
+                .FirstOrDefault();
+
+            if (basePick.Key != 0 || basePick.info.strideMax > 0)
+            {
+                vd.ActiveStream = basePick.Key;
+                vd.Stride = basePick.info.strideMax > 0 ? basePick.info.strideMax : 32;
+                vd.IndicesElem = basePick.info.idxEl;
+                vd.WeightsElem = basePick.info.wgtEl;
+                vd.HasXYZ = basePick.info.xyz; vd.HasNormal = basePick.info.nrm; vd.HasTangent = basePick.info.tan; vd.HasBinormal = basePick.info.bin;
+                vd.HasTexAny = basePick.info.texAny; vd.HasIndices = basePick.info.idx; vd.HasWeights = basePick.info.wgt;
+                return;
+            }
+
+            // 2) Otherwise, pick a morph-like stream: has XYZ, NO INDICES (weights optional)
+            var morphPick = groups
+                .Select(g => (g.Key, info: Features(g)))
+                .Where(x => x.info.xyz && !x.info.idx)
+                .OrderByDescending(x => x.info.strideMax)
+                .FirstOrDefault();
+
+            if (morphPick.info.strideMax > 0)
+            {
+                vd.ActiveStream = morphPick.Key;
+                vd.Stride = morphPick.info.strideMax > 0 ? morphPick.info.strideMax : 16;
+                vd.IndicesElem = morphPick.info.idxEl;
+                vd.WeightsElem = morphPick.info.wgtEl; // may be null on pure morphs
+                vd.HasXYZ = morphPick.info.xyz; vd.HasNormal = morphPick.info.nrm; vd.HasTangent = morphPick.info.tan; vd.HasBinormal = morphPick.info.bin;
+                vd.HasTexAny = morphPick.info.texAny; vd.HasIndices = morphPick.info.idx; vd.HasWeights = morphPick.info.wgt;
+                return;
+            }
+
+            // 3) Fallback: choose any stream with greatest stride
+            var anyPick = groups
+                .Select(g => (g.Key, info: Features(g)))
+                .OrderByDescending(x => x.info.strideMax)
+                .FirstOrDefault();
+
+            vd.ActiveStream = anyPick.Key;
+            vd.Stride = anyPick.info.strideMax > 0 ? anyPick.info.strideMax : 32;
+            vd.IndicesElem = anyPick.info.idxEl;
+            vd.WeightsElem = anyPick.info.wgtEl;
+            vd.HasXYZ = anyPick.info.xyz; vd.HasNormal = anyPick.info.nrm; vd.HasTangent = anyPick.info.tan; vd.HasBinormal = anyPick.info.bin;
+            vd.HasTexAny = anyPick.info.texAny; vd.HasIndices = anyPick.info.idx; vd.HasWeights = anyPick.info.wgt;
+        }
+
+        private sealed class SubMesh
+        {
+            public DictEntry VDESEntry;
+            public DictEntry VBEntry;
+            public DictEntry IBEntry; // may be null
+            public VDInfo VD;
+            public int VertexCount;
+        }
+
+        // ===== Big-endian helpers =====
+        static class BE
+        {
+            public static ushort U16(byte[] d, int o) => (ushort)((d[o] << 8) | d[o + 1]);
+            public static short I16(byte[] d, int o) => unchecked((short)U16(d, o));
+            public static uint U32(byte[] d, int o) => ((uint)d[o] << 24) | ((uint)d[o + 1] << 16) | ((uint)d[o + 2] << 8) | d[o + 3];
+            public static int I32(byte[] d, int o) => unchecked((int)U32(d, o));
+
+            // IMPORTANT: do NOT reverse again — U32 already assembled the BE bit-pattern.
+            public static unsafe float F32(byte[] d, int o)
+            {
+                uint v = U32(d, o); // big-endian bit pattern
+                return *(float*)&v;  // reinterpret bits as IEEE-754 float
+            }
+        }
+
+    }
+}
