@@ -231,7 +231,7 @@ namespace PSG_Viewer
             0x03 => "CELL_GCM_VERTEX_SF (F16)",
             0x04 => "CELL_GCM_VERTEX_UB (U8 norm)",
             0x05 => "CELL_GCM_VERTEX_S32K (S16 non-norm)",
-            0x06 => "CELL_GCM_VERTEX_CMP (CMP 11:11:10)",
+            0x06 => "CELL_GCM_VERTEX_CMP (DEC3N 10:10:10:2)",
             0x07 => "CELL_GCM_VERTEX_UB256 (U8 non-norm)",
             _ => $"0x{vt:X2}"
         };
@@ -542,8 +542,8 @@ namespace PSG_Viewer
             if (elem == null) return new Vec3(0, 0, 1);
             var e = elem.Value; int off = vOff + e.Offset;
 
-            // Preferred packed (CMP) for normals/tangents/binormals
-            if (e.VertexType == 0x06) // CMP 11:11:10 → DEC3N style
+
+            if (e.VertexType == 0x06)
             {
                 if (off + 4 <= d.Length) return DecodeDec3nPS3(d, off);
                 return new Vec3(1, 0, 0);
@@ -593,19 +593,36 @@ namespace PSG_Viewer
         }
 
         // DEC3N / INT_2_10_10_10_REV, PS3 byte order corrected
+        // DEC3N (signed, normalized) used for normals/tangents/binormals.
+        // Packing per pack_normal_dec3n:
+        //   scale [-1,1] by 511, round to [-511,511], 10-bit signed each
+        //   Bits  2..11 : X (10-bit)
+        //   Bits 12..21 : Y (10-bit)
+        //   Bits 22..31 : Z (10-bit)
+        //   Bits 0..1 unused.
+        // NOTE: Do NOT byteswap here; BE.U32 already returns the correct numeric value.
+        // We sign-extend from 10 bits and divide by 511, then re-normalize.
         static Vec3 DecodeDec3nPS3(byte[] d, int off)
         {
-            uint be = BE.U32(d, off);
-            // swap to little-endian layout of packed fields
-            uint v = ((be & 0xFFu) << 24) | ((be & 0xFF00u) << 8) | ((be >> 8) & 0xFF00u) | ((be >> 24) & 0xFFu);
-            int sx = (int)(v & 0x3FFu);
-            int sy = (int)((v >> 10) & 0x3FFu);
-            int sz = (int)((v >> 20) & 0x3FFu);
-            if ((sx & 0x200) != 0) sx -= 1 << 10;
-            if ((sy & 0x200) != 0) sy -= 1 << 10;
-            if ((sz & 0x200) != 0) sz -= 1 << 10;
-            const float k = 1.0f / 511.0f;
-            return Vec3.Normalize(new Vec3(sx * k, sy * k, sz * k));
+            if (off + 4 > d.Length) return new Vec3(1, 0, 0);
+
+            uint packed = BE.U32(d, off);
+
+            // Extract 10-bit signed components at the correct bit positions
+            int ix = (int)((packed >> 2) & 0x3FF);
+            int iy = (int)((packed >> 12) & 0x3FF);
+            int iz = (int)((packed >> 22) & 0x3FF);
+
+            // Two's-complement sign-extend from 10 bits
+            ix = (ix << 22) >> 22;
+            iy = (iy << 22) >> 22;
+            iz = (iz << 22) >> 22;
+
+            const float inv = 1.0f / 511.0f;
+            var v = new Vec3(ix * inv, iy * inv, iz * inv);
+
+            // Small deviations can accumulate; keep unit length.
+            return Vec3.Normalize(v);
         }
 
         static void RecomputeNormalsIfNeeded(SubMeshData sm)
@@ -779,7 +796,7 @@ namespace PSG_Viewer
                 case 0x04: // U8 normalized
                 case 0x07: // U8 non-normalized
                     return 1 * Math.Max(1, (int)numComponents);
-                case 0x06: // CMP (packed 2_10_10_10)
+                case 0x06: //CELL_GCM_VERTEX_CMP (DEC3N 10:10:10:2),
                     return 4;
                 default:
                     return 2 * Math.Max(1, (int)numComponents);
@@ -1101,6 +1118,7 @@ namespace PSG_Viewer
         private ToolStripLabel lblPick;
         private ToolStripComboBox cmbSubmesh;
         private StatusStrip status; private ToolStripStatusLabel lblCounts, lblCamera, lblSpacer;
+        private ToolStripButton tbtnExportObj;
 
         // Splitters
         private SplitContainer splitMain; private SplitContainer splitLeftRight; private SplitContainer splitPreviews;
@@ -1137,31 +1155,54 @@ namespace PSG_Viewer
 
         private void BuildUi()
         {
-            // Toolbar
+            // Toolbar (create the ToolStrip first)
             tool = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Stretch = true };
+
             tbtnOpen = new ToolStripButton("Open PSG") { DisplayStyle = ToolStripItemDisplayStyle.Text };
             tbtnResetCam = new ToolStripButton("Reset Camera") { DisplayStyle = ToolStripItemDisplayStyle.Text };
             tbtnFit = new ToolStripButton("Fit View") { DisplayStyle = ToolStripItemDisplayStyle.Text };
             tbtnCopyLog = new ToolStripButton("Copy Log") { DisplayStyle = ToolStripItemDisplayStyle.Text, ToolTipText = "Copy full log to clipboard" };
             lblPick = new ToolStripLabel("  Submesh: ");
             cmbSubmesh = new ToolStripComboBox { DropDownStyle = ComboBoxStyle.DropDownList, AutoSize = false, Width = 320 };
-            tool.Items.AddRange(new ToolStripItem[] { tbtnOpen, new ToolStripSeparator(), tbtnResetCam, tbtnFit, new ToolStripSeparator(), lblPick, cmbSubmesh, new ToolStripSeparator(), tbtnCopyLog });
-            Controls.Add(tool); tool.Dock = DockStyle.Top;
+
+            // Export OBJ button as a FIELD (so WireEvents can hook it later)
+            tbtnExportObj = new ToolStripButton("Export OBJ") { DisplayStyle = ToolStripItemDisplayStyle.Text };
+
+            tool.Items.AddRange(new ToolStripItem[]
+            {
+        tbtnOpen, new ToolStripSeparator(),
+        tbtnResetCam, tbtnFit, new ToolStripSeparator(),
+        lblPick, cmbSubmesh, new ToolStripSeparator(),
+        tbtnCopyLog, new ToolStripSeparator(),
+        tbtnExportObj
+            });
+
+            Controls.Add(tool);
+            tool.Dock = DockStyle.Top;
 
             // Status
-            status = new StatusStrip(); lblCounts = new ToolStripStatusLabel("Sub:0  V:0  T:0"); lblSpacer = new ToolStripStatusLabel { Spring = true }; lblCamera = new ToolStripStatusLabel("Yaw:0  Pitch:0  Zoom:1.0");
-            status.Items.AddRange(new ToolStripItem[] { lblCounts, lblSpacer, lblCamera }); Controls.Add(status); status.Dock = DockStyle.Bottom;
+            status = new StatusStrip();
+            lblCounts = new ToolStripStatusLabel("Sub:0  V:0  T:0");
+            lblSpacer = new ToolStripStatusLabel { Spring = true };
+            lblCamera = new ToolStripStatusLabel("Yaw:0  Pitch:0  Zoom:1.0");
+            status.Items.AddRange(new ToolStripItem[] { lblCounts, lblSpacer, lblCamera });
+            Controls.Add(status);
+            status.Dock = DockStyle.Bottom;
 
             // Main split
-            splitMain = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterWidth = 6 }; Controls.Add(splitMain);
+            splitMain = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterWidth = 6 };
+            Controls.Add(splitMain);
 
             // Left-right split
-            splitLeftRight = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Vertical, FixedPanel = FixedPanel.Panel1, SplitterWidth = 6 }; splitMain.Panel1.Controls.Add(splitLeftRight);
+            splitLeftRight = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Vertical, FixedPanel = FixedPanel.Panel1, SplitterWidth = 6 };
+            splitMain.Panel1.Controls.Add(splitLeftRight);
 
             // Options column
-            leftPanel = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(18, 30, 14, 16) }; splitLeftRight.Panel1.Controls.Add(leftPanel);
+            leftPanel = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(18, 30, 14, 16) };
+            splitLeftRight.Panel1.Controls.Add(leftPanel);
 
-            grpOptions = new GroupBox { Text = "Draw Options", Dock = DockStyle.Top, Height = 220, Padding = new Padding(10, 10, 10, 8) }; leftPanel.Controls.Add(grpOptions);
+            grpOptions = new GroupBox { Text = "Draw Options", Dock = DockStyle.Top, Height = 220, Padding = new Padding(10, 10, 10, 8) };
+            leftPanel.Controls.Add(grpOptions);
             int y = 18, x = 18, w = 260;
             chkShowFaces = new CheckBox { Left = x, Top = y, Width = w, Text = "Show Faces (Lambert)", Checked = true }; y += 24;
             chkShowNormals = new CheckBox { Left = x, Top = y, Width = w, Text = "Show Normals (blue)", Checked = true }; y += 24;
@@ -1173,7 +1214,8 @@ namespace PSG_Viewer
             grpOptions.Controls.AddRange(new Control[] { chkShowFaces, chkShowNormals, chkShowTangents, chkShowBinormals, chkSwapYZ, chkNormalizeUVs, chkFlipV });
 
             // Morph Preview group
-            grpMorph = new GroupBox { Text = "Morph Preview (for selected base submesh)", Dock = DockStyle.Top, Height = 130, Padding = new Padding(10, 10, 10, 10) }; leftPanel.Controls.Add(grpMorph);
+            grpMorph = new GroupBox { Text = "Morph Preview (for selected base submesh)", Dock = DockStyle.Top, Height = 130, Padding = new Padding(10, 10, 10, 10) };
+            leftPanel.Controls.Add(grpMorph);
             lblMorphTarget = new Label { Left = x, Top = 24, Width = 60, Text = "Target:" };
             cmbMorphTargets = new ComboBox { Left = x + 62, Top = 20, Width = 260, DropDownStyle = ComboBoxStyle.DropDownList };
             lblMorphWeight = new Label { Left = x, Top = 58, Width = 120, Text = "Weight: 0%" };
@@ -1181,19 +1223,24 @@ namespace PSG_Viewer
             grpMorph.Controls.AddRange(new Control[] { lblMorphTarget, cmbMorphTargets, lblMorphWeight, trkMorphWeight });
 
             // Previews split
-            splitPreviews = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Vertical, SplitterWidth = 6 }; splitLeftRight.Panel2.Controls.Add(splitPreviews);
+            splitPreviews = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Vertical, SplitterWidth = 6 };
+            splitLeftRight.Panel2.Controls.Add(splitPreviews);
 
             // 3D host
             viewHost3D = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8) };
             lbl3D = new Label { Dock = DockStyle.Top, Height = 22, Text = "3D (LMB rotate, RMB pan, Wheel zoom, Double-click reset)", Font = new Font("Segoe UI", 9, FontStyle.Bold) };
             pic3D = new PictureBox { Dock = DockStyle.None, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, TabStop = true };
-            viewHost3D.Controls.Add(pic3D); viewHost3D.Controls.Add(lbl3D); splitPreviews.Panel1.Controls.Add(viewHost3D);
+            viewHost3D.Controls.Add(pic3D);
+            viewHost3D.Controls.Add(lbl3D);
+            splitPreviews.Panel1.Controls.Add(viewHost3D);
 
             // UV host
             viewHostUV = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8) };
             lblUV = new Label { Dock = DockStyle.Top, Height = 22, Text = "UV Viewer (showing TEX0 of selected submesh)", Font = new Font("Segoe UI", 9, FontStyle.Bold) };
             picUV = new PictureBox { Dock = DockStyle.None, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White };
-            viewHostUV.Controls.Add(picUV); viewHostUV.Controls.Add(lblUV); splitPreviews.Panel2.Controls.Add(viewHostUV);
+            viewHostUV.Controls.Add(picUV);
+            viewHostUV.Controls.Add(lblUV);
+            splitPreviews.Panel2.Controls.Add(viewHostUV);
 
             // Log
             txtLog = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 9f) };
@@ -1202,8 +1249,11 @@ namespace PSG_Viewer
             // Initial square layout
             LayoutViewerSquare(viewHost3D, lbl3D, pic3D);
             LayoutViewerSquare(viewHostUV, lblUV, picUV);
-            cmbSubmesh.Items.Add("(All submeshes)"); cmbSubmesh.SelectedIndex = 0; EnableMorphUI(false);
+            cmbSubmesh.Items.Add("(All submeshes)");
+            cmbSubmesh.SelectedIndex = 0;
+            EnableMorphUI(false);
         }
+
 
         private void WireEvents()
         {
@@ -1235,9 +1285,46 @@ namespace PSG_Viewer
 
             // 3D interactions
             pic3D.MouseEnter += (s, e) => pic3D.Focus();
-            pic3D.MouseDown += Pic3D_MouseDown; pic3D.MouseMove += Pic3D_MouseMove; pic3D.MouseUp += Pic3D_MouseUp; pic3D.MouseLeave += (s, e) => { isRotating = false; isPanning = false; };
-            pic3D.MouseWheel += Pic3D_MouseWheel; pic3D.DoubleClick += (s, e) => { ResetCamera(); RenderPreviews(); UpdateStatus(); };
+            pic3D.MouseDown += Pic3D_MouseDown;
+            pic3D.MouseMove += Pic3D_MouseMove;
+            pic3D.MouseUp += Pic3D_MouseUp;
+            pic3D.MouseLeave += (s, e) => { isRotating = false; isPanning = false; };
+            pic3D.MouseWheel += Pic3D_MouseWheel;
+            pic3D.DoubleClick += (s, e) => { ResetCamera(); RenderPreviews(); UpdateStatus(); };
+
+            // Export OBJ (hook the FIELD created in BuildUi)
+            if (tbtnExportObj != null)
+            {
+                tbtnExportObj.Click += (s, e) =>
+                {
+                    if (scene == null || scene.SubMeshes == null || scene.SubMeshes.Count == 0)
+                    {
+                        Log("Nothing to export.");
+                        return;
+                    }
+
+                    using var sfd = new SaveFileDialog
+                    {
+                        Title = "Export OBJ",
+                        Filter = "OBJ (*.obj)|*.obj",
+                        FileName = ((currentFilePath != null ? Path.GetFileNameWithoutExtension(currentFilePath) : "mesh") + ".obj")
+                    };
+
+                    if (sfd.ShowDialog(this) != DialogResult.OK) return;
+
+                    try
+                    {
+                        ObjExporter.ExportSceneToObj(scene, sfd.FileName, bakeYupToZup: true, flipV: false, includeNormals: true);
+                        Log($"Exported OBJ: {sfd.FileName}");
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendException("Export OBJ", ex);
+                    }
+                };
+            }
         }
+
 
         private void OpenPsg()
         {
