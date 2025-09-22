@@ -1,0 +1,122 @@
+using System;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Collections.Generic;
+
+namespace PSG_Viewer
+{
+    static class ObjExporter
+    {
+        // Kept for API compatibility, but no longer used (we do NOT rotate on export).
+        // (x, y, z) -> (x, z, -y) was a +90° X rotation that caused double-rot in Blender.
+        static P RotateYupToZup<P>(P p) where P : struct => p;
+
+        /// <summary>
+        /// Exports the given scene to OBJ without baking any axis rotation or translation.
+        /// NOTE: 'bakeYupToZup' is intentionally ignored to avoid double-rotation on import in Blender.
+        /// </summary>
+        public static void ExportSceneToObj(
+            SceneData scene,
+            string outPath,
+            bool bakeYupToZup = true,   // kept in signature for compatibility; ignored
+            bool flipV = false,
+            bool includeNormals = true)
+        {
+            if (scene == null || scene.SubMeshes.Count == 0)
+                throw new InvalidOperationException("Nothing to export.");
+
+            Directory.CreateDirectory(Path.GetDirectoryName(outPath) ?? ".");
+            using var sw = new StreamWriter(outPath, false, new UTF8Encoding(false));
+            var inv = CultureInfo.InvariantCulture;
+
+            sw.WriteLine("# Skate 3 (PS3) OBJ export — no baked rotation/translation");
+            sw.WriteLine("# Vert order matches GPU vertex buffer order for skin binding.");
+
+            // Single 'o' so Blender imports one mesh object
+            var objName = Path.GetFileNameWithoutExtension(outPath);
+            sw.WriteLine($"o {objName}");
+
+            int voff = 0; // running vertex offset for faces (OBJ indices are 1-based)
+
+            foreach (var sm in scene.SubMeshes)
+            {
+                if (sm.Positions.Count == 0) continue;
+
+                sw.WriteLine();
+                sw.WriteLine($"# Submesh {sm.Name}");
+                sw.WriteLine($"g {sm.Name}");
+
+                // v (POSITIONS) — write raw, no rotation or offset
+                for (int i = 0; i < sm.Positions.Count; i++)
+                {
+                    var p = sm.Positions[i];
+                    sw.WriteLine($"v {p.X.ToString(inv)} {p.Y.ToString(inv)} {p.Z.ToString(inv)}");
+                }
+
+                // vt (UVs; one per vertex)
+                for (int i = 0; i < sm.UVs.Count; i++)
+                {
+                    var uv = sm.UVs[i];
+                    float u = uv.X;
+                    float v = flipV ? 1f - uv.Y : uv.Y;
+                    sw.WriteLine($"vt {u.ToString(inv)} {v.ToString(inv)}");
+                }
+                if (sm.UVs.Count != sm.Positions.Count)
+                {
+                    // Fill missing vt if any (rare)
+                    for (int i = sm.UVs.Count; i < sm.Positions.Count; i++)
+                        sw.WriteLine("vt 0 0");
+                }
+
+                // vn (NORMALS; one per vertex) — write raw, no rotation
+                if (includeNormals)
+                {
+                    if (sm.Normals.Count != sm.Positions.Count)
+                    {
+                        var recomputed = PsgParser.BuildNormals(sm, sm.Positions);
+                        for (int i = 0; i < recomputed.Count; i++)
+                        {
+                            var n = recomputed[i];
+                            sw.WriteLine($"vn {n.X.ToString(inv)} {n.Y.ToString(inv)} {n.Z.ToString(inv)}");
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < sm.Normals.Count; i++)
+                        {
+                            var n = sm.Normals[i];
+                            sw.WriteLine($"vn {n.X.ToString(inv)} {n.Y.ToString(inv)} {n.Z.ToString(inv)}");
+                        }
+                    }
+                }
+                else
+                {
+                    // still must emit dummy vn to keep v/vt/vn aligned one-to-one
+                    for (int i = 0; i < sm.Positions.Count; i++) sw.WriteLine("vn 0 0 1");
+                }
+
+                // faces: use identical index for v/vt/vn (keeps 1:1 with vertex order)
+                if (sm.Triangles.Count > 0)
+                {
+                    foreach (var t in sm.Triangles)
+                    {
+                        int a = voff + t.A + 1;
+                        int b = voff + t.B + 1;
+                        int c = voff + t.C + 1;
+                        sw.WriteLine($"f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}");
+                    }
+                }
+                else
+                {
+                    // no IB: omit faces (point cloud export optional)
+                }
+
+                voff += sm.Positions.Count;
+            }
+
+            sw.Flush();
+        }
+    }
+}
