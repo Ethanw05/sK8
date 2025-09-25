@@ -763,7 +763,12 @@ def compute_default_bone_length(heads):
 
 # ====== Build everything ======
 
-def run_import(psg_path):
+def run_import(psg_path, mesh_name=MESH_NAME, armature_name=ARMATURE_NAME, make_collection=MAKE_COLLECTION, context=None):
+    """Import the supplied PSG file into Blender.
+
+    Parameters mirror the legacy global flags so the importer can be
+    orchestrated programmatically (for example from other add-ons).
+    """
     with open(psg_path, 'rb') as f:
         d = bytearray(f.read())
     arena = parse_arena(d)
@@ -776,21 +781,23 @@ def run_import(psg_path):
     positions, normals, tangents, binormals, uvs, faces, skin_indices, skin_weights = build_geometry_and_skin(d, base, palette)
 
     # ---- Armature (fresh) ----
-    if ARMATURE_NAME in bpy.data.objects:
-        bpy.data.objects.remove(bpy.data.objects[ARMATURE_NAME], do_unlink=True)
-    if ARMATURE_NAME in bpy.data.armatures:
-        bpy.data.armatures.remove(bpy.data.armatures[ARMATURE_NAME], do_unlink=True)
+    if armature_name in bpy.data.objects:
+        bpy.data.objects.remove(bpy.data.objects[armature_name], do_unlink=True)
+    if armature_name in bpy.data.armatures:
+        bpy.data.armatures.remove(bpy.data.armatures[armature_name], do_unlink=True)
 
-    arm = bpy.data.armatures.new(ARMATURE_NAME)
-    arm_obj = bpy.data.objects.new(ARMATURE_NAME, arm)
-    if MAKE_COLLECTION:
+    arm = bpy.data.armatures.new(armature_name)
+    arm_obj = bpy.data.objects.new(armature_name, arm)
+    use_collection = make_collection if make_collection is not None else MAKE_COLLECTION
+    ctx = context or bpy.context
+    if use_collection:
         coll = bpy.data.collections.get("PSG_Import") or bpy.data.collections.new("PSG_Import")
-        if "PSG_Import" not in bpy.context.scene.collection.children:
-            bpy.context.scene.collection.children.link(coll)
+        if "PSG_Import" not in ctx.scene.collection.children:
+            ctx.scene.collection.children.link(coll)
         coll.objects.link(arm_obj)
     else:
-        bpy.context.collection.objects.link(arm_obj)
-    bpy.context.view_layer.objects.active = arm_obj
+        ctx.collection.objects.link(arm_obj)
+    ctx.view_layer.objects.active = arm_obj
 
     bpy.ops.object.mode_set(mode='EDIT')
     by_name={}
@@ -911,15 +918,15 @@ def run_import(psg_path):
     bpy.ops.object.mode_set(mode='OBJECT')
 
     # ---- Mesh object ----
-    mesh = bpy.data.meshes.new(MESH_NAME)
-    obj = bpy.data.objects.new(MESH_NAME, mesh)
-    if MAKE_COLLECTION:
+    mesh = bpy.data.meshes.new(mesh_name)
+    obj = bpy.data.objects.new(mesh_name, mesh)
+    if use_collection:
         coll = bpy.data.collections.get("PSG_Import") or bpy.data.collections.new("PSG_Import")
-        if "PSG_Import" not in bpy.context.scene.collection.children:
-            bpy.context.scene.collection.children.link(coll)
+        if "PSG_Import" not in ctx.scene.collection.children:
+            ctx.scene.collection.children.link(coll)
         coll.objects.link(obj)
     else:
-        bpy.context.collection.objects.link(obj)
+        ctx.collection.objects.link(obj)
 
     # Create geometry
     mesh.from_pydata([tuple(p) for p in positions], [], faces)
@@ -993,14 +1000,15 @@ def run_import(psg_path):
             if vg: vg.add([vi], ww, 'REPLACE')
 
     # Select and report
-    bpy.context.view_layer.objects.active = obj
+    ctx.view_layer.objects.active = obj
     obj.select_set(True)
     arm_obj.select_set(True)
     print(f"[Done] Bones={len(bone_names)}  Verts={len(mesh.vertices)}  Faces={len(mesh.polygons)}  Scale(S16)={S16_SCALE}")
     return obj, arm_obj
 
 # ====== Entry ======
-if PSG_PATH and os.path.isfile(PSG_PATH):
-    run_import(PSG_PATH)
-else:
-    raise FileNotFoundError(f"Set PSG_PATH to a valid file. Current: {PSG_PATH}")
+if __name__ == "__main__":
+    if PSG_PATH and os.path.isfile(PSG_PATH):
+        run_import(PSG_PATH)
+    else:
+        raise FileNotFoundError(f"Set PSG_PATH to a valid file. Current: {PSG_PATH}")
