@@ -1,0 +1,1006 @@
+# PSG → Blender (direct import, no OBJ/JSON) — Bones, Skin, Mesh
+# Usage: open in Blender's Text Editor, set PSG_PATH, then Run Script.
+# Keeps ALL transforms, offsets, scales, bone hierarchy, and bone-tail logic from the original importer.
+# Replaces external OBJ/JSON by parsing the .psg directly. Normals/Tangents/Binormals use CMP 11:11:10.
+# Tested on Blender 3.x/4.x. Big-endian PSG (PS3).
+
+import bpy, bmesh, math, mathutils, os, struct
+from mathutils import Vector, Matrix
+
+# ====== USER CONFIG ======
+PSG_PATH = r"C:\Users\ethan\Desktop\Skate download files\dev_hdd0\disc\Skate_3_BLUS\PS3_GAME\USRDIR\data\content\createacharacter\model\cas_db\OuterTorso\0x0000114903e38811.psg"# <-- set this
+MAKE_COLLECTION = True
+MESH_NAME = "PSG_Mesh"
+ARMATURE_NAME = "PSG_Armature"
+
+# ====== Bone hierarchy (kept 100%) ======
+# Order + names preserved exactly; first child is the preferred primary for direction/length.
+bone_hierarchy = {
+    "TRAJECTORY": None,
+    "HIPS": None,
+    "SPINE": "HIPS",
+    "SPINE1": "SPINE",
+    "SPINE2": "SPINE1",
+    "SPINE3": "SPINE2",
+    "NECK": "SPINE3",
+    "NECK1": "NECK",
+    "HEAD": "NECK1",
+
+    # Face/simple extras present in your JSON (map to HEAD)
+    "EYELIDS": "HEAD",
+    "EYEBROW": "HEAD",
+    "MOUTH": "HEAD",
+    "HEADEND": "HEAD",
+
+    # Arms
+    "RIGHTSHOULDER": "SPINE3",
+    "RIGHTARM": "RIGHTSHOULDER",
+    "RIGHTFOREARM": "RIGHTARM",
+    "RIGHTHAND": "RIGHTFOREARM",
+    "LEFTSHOULDER": "SPINE3",
+    "LEFTARM": "LEFTSHOULDER",
+    "LEFTFOREARM": "LEFTARM",
+    "LEFTHAND": "LEFTFOREARM",
+
+    # Fingers (already aligned with your JSON)
+    "LEFTHANDINDEX1": "LEFTHAND",
+    "LEFTHANDINDEX2": "LEFTHANDINDEX1",
+    "LEFTHANDRING1": "LEFTHAND",
+    "LEFTHANDRING2": "LEFTHANDRING1",
+    "RIGHTHANDINDEX1": "RIGHTHAND",
+    "RIGHTHANDINDEX2": "RIGHTHANDINDEX1",
+    # UPDATED BELOW: RIGHTHANDRING1 parent will be set under RIGHTHANDINRING
+    "RIGHTHANDRING1": "RIGHTHAND",  # will be overridden by explicit entry later
+    "RIGHTHANDRING2": "RIGHTHANDRING1",
+
+    # === Additions: Left hand chains ===
+    # Index
+    "LEFTHANDINDEX3": "LEFTHANDINDEX2",
+
+    # Middle
+    "LEFTHANDMIDDLE1": "LEFTHAND",
+    "LEFTHANDMIDDLE2": "LEFTHANDMIDDLE1",
+    "LEFTHANDMIDDLE3": "LEFTHANDMIDDLE2",
+
+    # Pinky (InHand parent → 1 → 2 → 3)
+    "LEFTINHANDPINKY": "LEFTHAND",
+    "LEFTHANDPINKY1": "LEFTINHANDPINKY",
+    "LEFTHANDPINKY2": "LEFTHANDPINKY1",
+    "LEFTHANDPINKY3": "LEFTHANDPINKY2",
+
+    # Ring (keep existing RING1/RING2; add extra nodes)
+    "LEFTINHANDRING": "LEFTHAND",
+    "LEFTHANDRING1": "LEFTINHANDRING",
+    "LEFTHANDRING3": "LEFTHANDRING2",
+
+    # Thumb (left) — 1–3 chain in addition to single-bone entry below
+    "LEFTHANDTHUMB1": "LEFTHAND",
+    "LEFTHANDTHUMB2": "LEFTHANDTHUMB1",
+    "LEFTHANDTHUMB3": "LEFTHANDTHUMB2",
+
+    # === Additions: Right hand chains (mirrors) ===
+    # Index
+    "RIGHTHANDINDEX3": "RIGHTHANDINDEX2",
+
+    # Middle
+    "RIGHTHANDMIDDLE1": "RIGHTHAND",
+    "RIGHTHANDMIDDLE2": "RIGHTHANDMIDDLE1",
+    "RIGHTHANDMIDDLE3": "RIGHTHANDMIDDLE2",
+
+    # Pinky
+    "RIGHTINHANDPINKY": "RIGHTHAND",
+    "RIGHTHANDPINKY1": "RIGHTINHANDPINKY",
+    "RIGHTHANDPINKY2": "RIGHTHANDPINKY1",
+    "RIGHTHANDPINKY3": "RIGHTHANDPINKY2",
+
+    # Ring (add explicit “InHand” parent and reparent Ring1 under it)
+    "RIGHTINHANDRING": "RIGHTHAND",
+    "RIGHTHANDRING": "RIGHTINHANDRING",
+    "RIGHTHANDRING1": "RIGHTINHANDRING",   # <-- updated
+    "RIGHTHANDRING3": "RIGHTHANDRING2",
+
+    # Thumbs (right) — 1–3 chain under RIGHTHAND
+    "RIGHTHANDTHUMB1": "RIGHTHAND",
+    "RIGHTHANDTHUMB2": "RIGHTHANDTHUMB1",
+    "RIGHTHANDTHUMB3": "RIGHTHANDTHUMB2",
+
+    # Thumbs: original single-bone entries (kept)
+    "LEFTHANDTHUMB": "LEFTHAND",
+    "RIGHTHANDTHUMB": "RIGHTHAND",
+
+    # Legs/feet (match JSON)
+    "RIGHTUPLEG": "HIPS",
+    "RIGHTLEG": "RIGHTUPLEG",
+    "RIGHTFOOT": "RIGHTLEG",
+    "RIGHTTOEBASE": "RIGHTFOOT",
+    "LEFTUPLEG": "HIPS",
+    "LEFTLEG": "LEFTUPLEG",
+    "LEFTFOOT": "LEFTLEG",
+    "LEFTTOEBASE": "LEFTFOOT",
+
+    # (Any skateboard bits or helper/offsets can remain; unused ones are ignored)
+    "SKATEBOARD_ROOT": None,
+    "TRUCK_FRONT": "SKATEBOARD_ROOT",
+    "RIGHT_WHEELFRONT": "TRUCK_FRONT",
+    "LEFT_WHEELFRONT": "TRUCK_FRONT",
+    "TRUCK_BACK": "SKATEBOARD_ROOT",
+    "LEFT_WHEELBACK": "TRUCK_BACK",
+    "RIGHT_WHEELBACK": "TRUCK_BACK",
+
+    # Kept for compatibility with other exports (not in your current JSON)
+    "RIGHTTOEBASE_REPARENTED": None,
+    "LEFTTOEBASE_REPARENTED": None,
+    "RIGHTHAND_REPARENTED": None,
+    "LEFTHAND_REPARENTED": None,
+    "RIGHTSHOULDERHLP": "SPINE3",
+    "RIGHTARMTWIST": "RIGHTARM",
+    "RIGHTFOREARMTWIST": "RIGHTFOREARM",
+    "RIGHTFOREARMTWIST1": "RIGHTFOREARM",
+    "LEFTSHOULDERHLP": "SPINE3",
+    "LEFTARMTWIST": "LEFTARM",
+    "LEFTFOREARMTWIST": "LEFTFOREARM",
+    "LEFTFOREARMTWIST1": "LEFTFOREARM",
+    "RIGHTUPLEGHLP": "HIPS",
+    "RIGHTUPLEGTWIST": "RIGHTUPLEG",
+    "LEFTUPLEGHLP": "HIPS",
+    "LEFTUPLEGTWIST": "LEFTUPLEG",
+}
+
+
+
+# ====== Basis & scale (kept 100%) ======
+# Orientation: Y-up (game) → Z-up (Blender) via +90° about X (bones only; mesh stays Y-up and is not rotated).
+YUP_TO_ZUP = Matrix.Rotation(math.radians(+90.0), 4, 'X')
+# Bones are pre-offset DOWN by 0.8 in game Y-up, then scaled by 63.363, then rotated to Blender.
+BONE_SCALE = 63.363
+BONE_PRE_OFFSET_DOWN_Y = 0.8
+# Mesh S16 dequant * world scale (baked to mesh)
+S16_SCALE = 63.363 / 16384.0
+
+# ====== Helpers: big-endian reads ======
+
+def be_u16(d, o):
+    return (d[o] << 8) | d[o+1]
+
+def be_i16(d, o):
+    v = be_u16(d, o)
+    return v - 0x10000 if v & 0x8000 else v
+
+def be_u32(d, o):
+    return (d[o] << 24) | (d[o+1] << 16) | (d[o+2] << 8) | d[o+3]
+
+def be_i32(d, o):
+    v = be_u32(d, o)
+    return v - 0x100000000 if v & 0x80000000 else v
+
+def be_f32(d, o):
+    return struct.unpack('>f', d[o:o+4])[0]
+
+def be_half_to_float(h):
+    s = (h >> 15) & 0x1
+    e = (h >> 10) & 0x1F
+    m = h & 0x3FF
+    if e == 0:
+        if m == 0:
+            f = s << 31
+        else:
+            while (m & 0x400) == 0:
+                m <<= 1
+                e -= 1
+            m &= 0x3FF
+            e = 127 - 15 + 1 + e
+            f = (s << 31) | (e << 23) | (m << 13)
+    elif e == 31:
+        f = (s << 31) | 0x7F800000 | (m << 13)
+    else:
+        e = e + (127 - 15)
+        f = (s << 31) | (e << 23) | (m << 13)
+    return struct.unpack('>f', struct.pack('>I', f))[0]
+
+# ====== PS3 enums ======
+# D3DDECLUSAGE (official names) for semantics — used for reporting/debug and consistent naming
+D3DDECLUSAGE = {
+    0x00: "D3DDECLUSAGE_POSITION",
+    0x01: "D3DDECLUSAGE_BLENDWEIGHT",
+    0x02: "D3DDECLUSAGE_BLENDINDICES",
+    0x03: "D3DDECLUSAGE_NORMAL",
+    0x04: "D3DDECLUSAGE_PSIZE",
+    0x05: "D3DDECLUSAGE_TEXCOORD",
+    0x06: "D3DDECLUSAGE_TANGENT",
+    0x07: "D3DDECLUSAGE_BINORMAL",
+    0x08: "D3DDECLUSAGE_TESSFACTOR",
+    0x0A: "D3DDECLUSAGE_COLOR",
+    0x0B: "D3DDECLUSAGE_FOG",
+    0x0C: "D3DDECLUSAGE_DEPTH",
+    0x0D: "D3DDECLUSAGE_SAMPLE",
+}
+
+def usage_name_for_ps3_elem(etype:int, tex_set:int|None=None)->str:
+    """Map PS3 ElementType to official D3DDECLUSAGE name (for logs/UI)."""
+    if etype == 0x00: return D3DDECLUSAGE[0x00]  # POSITION
+    if etype == 0x01: return D3DDECLUSAGE[0x01]  # BLENDWEIGHT
+    if etype == 0x02: return D3DDECLUSAGE[0x03]  # NORMAL
+    if etype == 0x03: return D3DDECLUSAGE[0x0A]  # COLOR (diffuse/specular)
+    if etype == 0x04: return D3DDECLUSAGE[0x04]  # PSIZE (treat SPECULAR as PSIZE? engines vary; for logs only)
+    if etype == 0x07: return D3DDECLUSAGE[0x02]  # BLENDINDICES
+    if 0x08 <= etype <= 0x0D:
+        # TEXCOORD set index = etype-0x08
+        return f"{D3DDECLUSAGE[0x05]}{'' if tex_set is None else str(tex_set)}"
+    if etype == 0x0E: return D3DDECLUSAGE[0x06]  # TANGENT
+    if etype == 0x0F: return D3DDECLUSAGE[0x07]  # BINORMAL
+    return f"ET_{etype:02X}"  # fallback
+
+
+VT_S1   = 0x01  # S16 (normalized for vectors)
+VT_F32  = 0x02
+VT_F16  = 0x03
+VT_UB   = 0x04  # U8 normalized
+VT_S32K = 0x05  # S16 non-normalized
+VT_CMP  = 0x06  # Packed direction (we'll treat as CMP 11:11:10 in this importer)
+VT_UB256= 0x07  # U8 non-normalized
+
+ET_XYZ      = 0x00
+ET_WEIGHTS  = 0x01
+ET_NORMAL   = 0x02
+ET_VCOLOR   = 0x03
+ET_SPEC     = 0x04
+ET_INDICES  = 0x07
+ET_TEX0     = 0x08
+ET_TEX1     = 0x09
+ET_TEX2     = 0x0A
+ET_TEX3     = 0x0B
+ET_TEX4     = 0x0C
+ET_TEX5     = 0x0D
+ET_TANGENT  = 0x0E
+ET_BINORMAL = 0x0F
+
+# ====== Packed vectors: CMP 11:11:10 ======
+
+def _snorm_from_bits(v:int, bits:int)->float:
+    # Sign-extend then normalize to [-1,1] using SNORM rule; clamp to [-1,1].
+    sign_bit = 1 << (bits - 1)
+    full = 1 << bits
+    if v & sign_bit:
+        v = v - full  # two's complement negative
+    denom = (1 << (bits - 1)) - 1  # 2^(bits-1)-1 (e.g., 1023 for 11-bit)
+    x = v / float(denom)
+    if x < -1.0: x = -1.0
+    if x > 1.0: x = 1.0
+    return x
+
+def decode_cmp_111110(d, off):
+    """CMP 11:11:10 → (x,y,z) in [-1,1], sign-extended, saturated, then unit-normalized.
+    Matches PsgParsedViewer.cs and original Python (DEC3N-like, 11/11/10)."""
+    if off < 0 or off + 4 > len(d):
+        return Vector((0.0, 0.0, 1.0))
+    p = be_u32(d, off)
+    ix = (p >> 0)  & 0x7FF  # 11 bits
+    iy = (p >> 11) & 0x7FF  # 11 bits
+    iz = (p >> 22) & 0x3FF  # 10 bits
+    x = _snorm_from_bits(ix, 11)
+    y = _snorm_from_bits(iy, 11)
+    z = _snorm_from_bits(iz, 10)
+    v = Vector((x, y, z))
+    l = v.length
+    return v / l if l > 1e-8 else Vector((0.0, 0.0, 1.0))
+    if off < 0 or off + 4 > len(d):
+        return Vector((0.0, 0.0, 1.0))
+    p = be_u32(d, off)
+    ix = p & 0x7FF         # 11 bits
+    iy = (p >> 11) & 0x7FF # 11 bits
+    iz = (p >> 22) & 0x3FF # 10 bits
+    # sign-extend
+    ix = (ix << 21) >> 21
+    iy = (iy << 21) >> 21
+    iz = (iz << 22) >> 22
+    x = ix / 1023.0
+    y = iy / 1023.0
+    z = iz / 511.0
+    v = Vector((x, y, z))
+    l = v.length
+    return v / l if l > 1e-8 else Vector((0.0, 0.0, 1.0))
+
+# ====== Vertex decoders ======
+
+def decode_position(d, off, vt, comps):
+    if vt == VT_F32 and off + 12 <= len(d):
+        return Vector((be_f32(d, off+0), be_f32(d, off+4), be_f32(d, off+8)))
+    if vt in (VT_S1, VT_S32K) and off + 6 <= len(d):
+        return Vector((float(be_i16(d, off+0)), float(be_i16(d, off+2)), float(be_i16(d, off+4))))
+    return Vector((0.0, 0.0, 0.0))
+
+def decode_uv(d, off, vt):
+    if vt == VT_F16 and off + 4 <= len(d):
+        return (be_half_to_float(be_u16(d, off+0)), be_half_to_float(be_u16(d, off+2)))
+    if vt in (VT_S1, VT_S32K) and off + 4 <= len(d):
+        return (float(be_i16(d, off+0)), float(be_i16(d, off+2)))
+    if vt == VT_F32 and off + 8 <= len(d):
+        return (be_f32(d, off+0), be_f32(d, off+4))
+    if vt in (VT_UB, VT_UB256) and off + 2 <= len(d):
+        return (d[off+0] / 255.0, d[off+1] / 255.0)
+    return (0.0, 0.0)
+
+def decode_auto_dir(d, off, vt, comps):
+    if vt == VT_CMP:
+        return decode_cmp_111110(d, off)
+    if vt == VT_F16 and off + 6 <= len(d):
+        v = Vector((be_half_to_float(be_u16(d, off+0)), be_half_to_float(be_u16(d, off+2)), be_half_to_float(be_u16(d, off+4))))
+        l = v.length
+        return v / l if l > 1e-8 else Vector((0.0, 0.0, 1.0))
+    if vt == VT_F32 and off + 12 <= len(d):
+        v = Vector((be_f32(d, off+0), be_f32(d, off+4), be_f32(d, off+8)))
+        l = v.length
+        return v / l if l > 1e-8 else Vector((0.0, 0.0, 1.0))
+    if vt in (VT_S1, VT_S32K) and off + 6 <= len(d):
+        v = Vector((float(be_i16(d, off+0))/32767.0, float(be_i16(d, off+2))/32767.0, float(be_i16(d, off+4))/32767.0))
+        l = v.length
+        return v / l if l > 1e-8 else Vector((0.0, 0.0, 1.0))
+    if vt in (VT_UB, VT_UB256) and off + 3 <= len(d):
+        v = Vector(((d[off+0]/255.0)*2.0-1.0, (d[off+1]/255.0)*2.0-1.0, (d[off+2]/255.0)*2.0-1.0))
+        l = v.length
+        return v / l if l > 1e-8 else Vector((0.0, 0.0, 1.0))
+    return Vector((0.0, 0.0, 1.0))
+
+# ====== Arena & VDES parsing ======
+RW_CORE_SECTIONTYPES = 0x00010005
+RW_GRAPHICS_VERTEXDESCRIPTOR = 0x000200E9
+RW_GRAPHICS_VERTEXBUFFER    = 0x000200EA
+RW_GRAPHICS_INDEXBUFFER     = 0x000200EB
+
+def is_base_resource(tid):
+    return 0x00010030 <= tid <= 0x0001003F
+
+class DictEntry:
+    __slots__ = ("index","ptr","size","align","typeIndex","typeId","blockStart","blockEnd")
+    def __init__(self, index, ptr, size, align, typeIndex, typeId, blockStart, blockEnd):
+        self.index=index; self.ptr=ptr; self.size=size; self.align=align; self.typeIndex=typeIndex; self.typeId=typeId
+        self.blockStart=blockStart; self.blockEnd=blockEnd
+
+class Arena:
+    __slots__ = ("dict","types","dictStart","resourceMainBase")
+    def __init__(self):
+        self.dict=[]; self.types=[]; self.dictStart=0; self.resourceMainBase=0
+
+class VDElem:
+    __slots__ = ("vt","num","stream","offset","stride","etype","cls")
+    def __init__(self, vt, num, stream, offset, stride, etype, cls):
+        self.vt=vt; self.num=num; self.stream=stream; self.offset=offset; self.stride=stride; self.etype=etype; self.cls=cls
+
+class VDInfo:
+    def __init__(self):
+        self.elems=[]
+        self.pos=None; self.norm=None; self.tan=None; self.bin=None
+        self.tex={}  # setIndex -> elem
+        self.activeStream=None
+        self.stride=0
+        self.indices=None
+        self.weights=None
+    def choose_stream_and_stride(self):
+        # Prefer stream of XYZ if present; otherwise the stream with most elements
+        if self.pos is not None:
+            self.activeStream = self.pos.stream
+        else:
+            counts={}
+            for e in self.elems:
+                counts[e.stream]=counts.get(e.stream,0)+1
+            self.activeStream = max(counts, key=counts.get) if counts else 0
+        # Stride is the stride field of elements in the active stream (should be consistent)
+        s_candidates = [e.stride for e in self.elems if e.stream==self.activeStream and e.stride>0]
+        self.stride = s_candidates[0] if s_candidates else 0
+
+def parse_arena(d):
+    if len(d) < 0x60: raise RuntimeError("Too small to be a valid Arena")
+    numEntries = be_u32(d, 0x20)
+    dictStart = be_u32(d, 0x30)
+    mainBase  = be_u32(d, 0x44)
+    arena = Arena(); arena.dictStart=dictStart; arena.resourceMainBase=mainBase
+    # Types via scanning for RW_CORE_SECTIONTYPES
+    found=-1
+    for p in range(0, len(d)-12, 4):
+        if be_u32(d, p) == RW_CORE_SECTIONTYPES:
+            found=p; break
+    if found>=0:
+        num = be_u32(d, found+4)
+        off = be_u32(d, found+8)
+        tp = found + off
+        for i in range(num):
+            if tp + i*4 + 4 <= len(d): arena.types.append(be_u32(d, tp + i*4))
+    # Dictionary
+    q = dictStart
+    for i in range(numEntries):
+        if q + 0x18 > len(d): break
+        ptr = be_u32(d, q+0x00)
+        size= be_u32(d, q+0x08)
+        align=be_u32(d, q+0x0C)
+        typeIndex=be_u32(d, q+0x10)
+        typeId=be_u32(d, q+0x14)
+        if arena.types and typeIndex < len(arena.types):
+            typeId = arena.types[typeIndex]
+        blockStart = (arena.resourceMainBase + ptr) if is_base_resource(typeId) else ptr
+        blockEnd = max(blockStart, blockStart + size)
+        blockEnd = min(blockEnd, len(d))
+        arena.dict.append(DictEntry(i, ptr, size, align, typeIndex, typeId, blockStart, blockEnd))
+        q += 0x18
+    return arena
+
+# Deterministic Carrier finder: validate header at +0x20 and name/IBM tables
+
+def find_carrier(d, arena):
+    for e in arena.dict:
+        hdr = e.blockStart + 0x20
+        if hdr + 0x24 > len(d):
+            continue
+        offIBM   = be_u32(d, hdr + 0x00)
+        offTblIdx= be_u32(d, hdr + 0x08)
+        offNames = be_u32(d, hdr + 0x0C)
+        boneCount= be_u16(d, hdr + 0x14)
+        if not (0 < boneCount <= 512):
+            continue
+        ibmAbs  = e.blockStart + offIBM
+        idxAbs  = e.blockStart + offTblIdx
+        nameAbs = e.blockStart + offNames
+        def inBlock(p, l):
+            return (p >= e.blockStart) and (p + l <= e.blockEnd)
+        if not inBlock(ibmAbs, boneCount*64):
+            continue
+        if not inBlock(idxAbs, boneCount*4):
+            continue
+        if not inBlock(nameAbs, 1):
+            continue
+        rel0 = be_u32(d, idxAbs + 0)
+        p0 = e.blockStart + rel0
+        if not inBlock(p0, 1):
+            continue
+        # quick C-string check
+        ok=False
+        for i in range(p0, min(p0+64, e.blockEnd)):
+            b=d[i]
+            if b==0: ok=True; break
+            if b<0x20 or b>0x7E: ok=False; break
+        if not ok:
+            continue
+        return e
+    raise RuntimeError("Carrier header not found deterministically.")
+
+# Parse VDES block (elements are 8 bytes each: vt,num,stream,offset, stride(u16), type, class)
+
+def parse_vdes(d, start, end):
+    vd = VDInfo()
+    # Properly parse the 16-byte VDES header, then read exactly numElements entries (8 bytes each).
+    if start + 16 > len(d):
+        return vd
+    refCount   = be_u32(d, start + 0)
+    typesFlags = be_u32(d, start + 4)
+    numStreams = be_u16(d, start + 8)
+    numElems   = be_u16(d, start + 10)
+    freqMask   = be_u16(d, start + 12)  # this was mistakenly treated like stride before
+    pad0       = be_u16(d, start + 14)
+
+    p = start + 16
+    for i in range(numElems):
+        if p + 8 > end:
+            break
+        vt     = d[p+0]
+        num    = d[p+1]
+        stream = d[p+2]
+        off    = d[p+3]
+        stride = be_u16(d, p+4)
+        etype  = d[p+6]
+        cls    = d[p+7]
+        e = VDElem(vt, num, stream, off, stride, etype, cls)
+        vd.elems.append(e)
+        if etype == ET_XYZ and vd.pos is None: vd.pos = e
+        if etype == ET_NORMAL and vd.norm is None: vd.norm = e
+        if etype == ET_TANGENT and vd.tan is None: vd.tan = e
+        if etype == ET_BINORMAL and vd.bin is None: vd.bin = e
+        if etype in (ET_TEX0,ET_TEX1,ET_TEX2,ET_TEX3,ET_TEX4,ET_TEX5):
+            set_idx = etype - ET_TEX0
+            if set_idx not in vd.tex: vd.tex[set_idx]=e
+        if etype == ET_INDICES and vd.indices is None: vd.indices = e
+        if etype == ET_WEIGHTS and vd.weights is None: vd.weights = e
+        p += 8
+
+    vd.choose_stream_and_stride()
+    return vd
+
+# Pair VB↔VD and nearby IB; read BaseResource to get actual VB/IB bytes
+
+def pair_streams_and_decode(d, arena):
+    vds = [e for e in arena.dict if e.typeId == RW_GRAPHICS_VERTEXDESCRIPTOR]
+    vbs = [e for e in arena.dict if e.typeId == RW_GRAPHICS_VERTEXBUFFER]
+    ibs = [e for e in arena.dict if e.typeId == RW_GRAPHICS_INDEXBUFFER]
+    vds.sort(key=lambda x:x.index); vbs.sort(key=lambda x:x.index); ibs.sort(key=lambda x:x.index)
+    vd_infos = [parse_vdes(d, e.blockStart, e.blockEnd) for e in vds]
+
+    def next_vd_for_vb(vb_index):
+        nextVbIdx = min([x.index for x in vbs if x.index>vb_index]+[10**9])
+        cand = None
+        for vd in vds:
+            if vd.index>vb_index and vd.index<nextVbIdx:
+                cand = vd; break
+        if cand is None:
+            # fallback: closest before
+            prev = sorted([vd for vd in vds if vd.index<vb_index], key=lambda x: abs(x.index-vb_index))
+            if prev: cand = prev[0]
+        return vds.index(cand) if cand else 0
+
+    triples=[]
+    if len(vbs)==len(ibs):
+        for i in range(len(vbs)):
+            triples.append((vbs[i], next_vd_for_vb(vbs[i].index), ibs[i]))
+    else:
+        used=set()
+        for ib in ibs:
+            vb = sorted(vbs, key=lambda v: abs(v.index - ib.index))[0]
+            used.add(vb.index)
+            triples.append((vb, next_vd_for_vb(vb.index), ib))
+        for vb in vbs:
+            if vb.index not in used:
+                triples.append((vb, next_vd_for_vb(vb.index), None))
+
+    subs=[]
+    for (vb, vdIdx, ib) in triples:
+        vd = vd_infos[vdIdx]
+        # VB -> BR
+        if vb.blockStart + 12 > len(d):
+            continue
+        vbBRIndex = be_u32(d, vb.blockStart + 0)
+        if not (0 <= vbBRIndex < len(arena.dict)): continue
+        brVB = arena.dict[vbBRIndex]
+        if not is_base_resource(brVB.typeId): continue
+        vbStart = brVB.blockStart; vbSize = brVB.size
+        stride = vd.stride if vd.stride>0 else vbSize
+        vCount = (vbSize // stride) if stride>0 else 0
+        # IB (optional)
+        ibStart = -1; ibCount16=0; ibBRIndex=None
+        if ib is not None:
+            if ib.blockStart + 12 <= len(d):
+                ibBRIndex = be_u32(d, ib.blockStart + 0)
+                if 0 <= ibBRIndex < len(arena.dict):
+                    brIB = arena.dict[ibBRIndex]
+                    if is_base_resource(brIB.typeId):
+                        ibStart = brIB.blockStart
+                        ibSize = brIB.size
+                        ibCount16 = ibSize//2
+        subs.append({
+            'name': f"SM_VB{vb.index}_IB{ib.index if ib else '—'}",
+            'vd': vd,
+            'vbStart': vbStart,
+            'vbSize': vbSize,
+            'stride': stride,
+            'vCount': vCount,
+            'ibStart': ibStart,
+            'ibCount16': ibCount16,
+            'vdIndex': vds[vdIdx].index,
+            'vbIndex': vb.index,
+            'ibIndex': (ib.index if ib else -1),
+        })
+    # Choose base submesh: has IB and INDICES+WEIGHTS; prefer richer layout
+    base = None
+    cands=[s for s in subs if s['ibStart']>=0 and s['vd'].indices and s['vd'].weights]
+    if not cands:
+        cands=[s for s in subs if s['vd'].indices and s['vd'].weights]
+    if cands:
+        base = sorted(cands, key=lambda s: (int(s['vd'].tan is not None), int(s['vd'].bin is not None), len(s['vd'].tex)>0, s['stride']), reverse=True)[0]
+    return base, subs
+
+# Read Carrier → bone names + IBMs (invert to bind matrices)
+
+def read_bones_from_carrier(d, carrier):
+    hdr = carrier.blockStart + 0x20
+    offIBM   = be_u32(d, hdr + 0x00)
+    offTblIdx= be_u32(d, hdr + 0x08)
+    offNames = be_u32(d, hdr + 0x0C)
+    boneCount= be_u16(d, hdr + 0x14)
+    ibmAbs  = carrier.blockStart + offIBM
+    idxAbs  = carrier.blockStart + offTblIdx
+    nameAbs = carrier.blockStart + offNames
+    # Names
+    names=[None]*boneCount
+    for i in range(boneCount):
+        rel = be_u32(d, idxAbs + 4*i)
+        p = carrier.blockStart + rel
+        s=[]
+        while p < carrier.blockEnd and d[p] != 0:
+            s.append(chr(d[p])); p+=1
+        names[i] = ''.join(s)
+    # IBMs row-major
+    ibms=[]
+    for i in range(boneCount):
+        m=[ [0.0]*4 for _ in range(4) ]
+        q = ibmAbs + i*64
+        for r in range(4):
+            for c in range(4):
+                m[r][c] = be_f32(d, q); q+=4
+        ibms.append(m)
+    # Invert to Bind matrices (row-major)
+    binds=[]
+    for m in ibms:
+        M = Matrix((
+            (m[0][0], m[0][1], m[0][2], m[0][3]),
+            (m[1][0], m[1][1], m[1][2], m[1][3]),
+            (m[2][0], m[2][1], m[2][2], m[2][3]),
+            (m[3][0], m[3][1], m[3][2], m[3][3]),
+        ))
+        try:
+            B = M.inverted()
+        except Exception:
+            raise RuntimeError("IBM not invertible")
+        # back to row-major lists for reuse with importer code
+        binds.append([[B[0][0],B[0][1],B[0][2],B[0][3]],
+                      [B[1][0],B[1][1],B[1][2],B[1][3]],
+                      [B[2][0],B[2][1],B[2][2],B[2][3]],
+                      [B[3][0],B[3][1],B[3][2],B[3][3]]])
+    return names, binds, ibms
+
+# Palette (dict type 0x00EB0023) read from +0x6C until 0xFFFF or >= boneCount
+
+def read_palette(d, arena, boneCount):
+    palEntry = next((e for e in arena.dict if e.typeId == 0x00EB0023), None)
+    if palEntry is None:
+        raise RuntimeError("Bone palette (type 0x00EB0023) not found.")
+    p = palEntry.blockStart + 0x6C
+    palette=[]
+    while p + 2 <= len(d):
+        v = be_u16(d, p)
+        if v == 0xFFFF: break
+        if v >= boneCount: break
+        palette.append(v)
+        p += 2
+    if not palette:
+        raise RuntimeError("Bone palette empty.")
+    return palette
+
+# Build one drawable mesh from the chosen submesh; also decode per-vertex skin (mapped to GLOBAL via palette)
+
+def build_geometry_and_skin(d, base, palette):
+    vd = base['vd']
+    stride = base['stride']
+    v0 = base['vbStart']
+    N = base['vCount']
+    posE = vd.pos
+    nrmE = vd.norm
+    tanE = vd.tan
+    binE = vd.bin
+    uvE = vd.tex.get(0)
+    idxE = vd.indices
+    wgtE = vd.weights
+
+    positions=[]; normals=[]; tangents=[]; binormals=[]; uvs=[]
+    skin_indices=[]; skin_weights=[]
+
+    for i in range(N):
+        off = v0 + i*stride
+        # Position
+        if posE:
+            P = decode_position(d, off + posE.offset, posE.vt, posE.num)
+        else:
+            P = Vector((0.0,0.0,0.0))
+        positions.append(P)
+        # UV
+        if uvE:
+            u,v = decode_uv(d, off + uvE.offset, uvE.vt)
+            uvs.append((u,v))
+        else:
+            uvs.append((0.0,0.0))
+        # N/T/B
+        def dec_dir(E):
+            if not E: return Vector((0.0,0.0,1.0))
+            return decode_auto_dir(d, off + E.offset, E.vt, E.num)
+        normals.append(dec_dir(nrmE))
+        tangents.append(dec_dir(tanE))
+        binormals.append(dec_dir(binE))
+        # Skin (indices+weights) mapped via palette → GLOBAL indices
+        if idxE and wgtE:
+            # indices: read 4 bytes (U8), regardless of vt; UB256 is also U8 here
+            i0 = d[off + idxE.offset + 0] if off + idxE.offset + 1 <= len(d) else 0
+            i1 = d[off + idxE.offset + 1] if off + idxE.offset + 2 <= len(d) else 0
+            i2 = d[off + idxE.offset + 2] if off + idxE.offset + 3 <= len(d) else 0
+            i3 = d[off + idxE.offset + 3] if off + idxE.offset + 4 <= len(d) else 0
+            # weights
+            def read_weight(o, vt):
+                if vt in (VT_UB, VT_UB256):
+                    return d[o] / 255.0
+                if vt == VT_F32:
+                    return be_f32(d, o)
+                return d[o] / 255.0
+            w0 = read_weight(off + wgtE.offset + 0, wgtE.vt)
+            w1 = read_weight(off + wgtE.offset + 1, wgtE.vt)
+            w2 = read_weight(off + wgtE.offset + 2, wgtE.vt)
+            w3 = read_weight(off + wgtE.offset + 3, wgtE.vt)
+            # normalize
+            s = max(1e-8, (w0+w1+w2+w3))
+            w0/=s; w1/=s; w2/=s; w3/=s
+            # map via palette
+            def map_slot(b):
+                return palette[b] if 0 <= b < len(palette) else -1
+            skin_indices.append((map_slot(i0), map_slot(i1), map_slot(i2), map_slot(i3)))
+            skin_weights.append((w0,w1,w2,w3))
+        else:
+            skin_indices.append((-1,-1,-1,-1))
+            skin_weights.append((0.0,0.0,0.0,0.0))
+
+    # Indices (tri list, u16)
+    faces=[]
+    if base['ibStart']>=0 and base['ibCount16']>=3:
+        triCount = base['ibCount16']//3
+        p = base['ibStart']
+        for i in range(triCount):
+            a = be_u16(d, p + i*6 + 0)
+            b = be_u16(d, p + i*6 + 2)
+            c = be_u16(d, p + i*6 + 4)
+            if a < N and b < N and c < N:
+                faces.append((a,b,c))
+
+    return positions, normals, tangents, binormals, uvs, faces, skin_indices, skin_weights
+
+# ====== Armature construction (kept 100% from original logic) ======
+
+def expert_decompose_row_major(rows):
+    tx = rows[3][0]
+    ty = rows[3][1] - BONE_PRE_OFFSET_DOWN_Y
+    tz = rows[3][2]
+    t_scaled = Vector((tx * BONE_SCALE, ty * BONE_SCALE, tz * BONE_SCALE))
+    T = (YUP_TO_ZUP @ Matrix.Translation(t_scaled)).to_translation()
+    rot_no_scale = Matrix((
+        (rows[0][0], rows[1][0], rows[2][0]),
+        (rows[0][1], rows[1][1], rows[2][1]),
+        (rows[0][2], rows[1][2], rows[2][2]),
+    ))
+    R = (YUP_TO_ZUP.to_3x3() @ rot_no_scale).normalized()
+    return T, R
+
+def _norm(n:str)->str:
+    return (n or "").replace(" ", "").replace("_", "").replace("-", "").upper()
+
+def compute_default_bone_length(heads):
+    if not heads:
+        return 0.1
+    mn = Vector((min(p.x for p in heads), min(p.y for p in heads), min(p.z for p in heads)))
+    mx = Vector((max(p.x for p in heads), max(p.y for p in heads), max(p.z for p in heads)))
+    diag = (mx - mn).length
+    return max(0.02 * diag, 0.05) if diag > 1e-6 else 0.1
+
+# ====== Build everything ======
+
+def run_import(psg_path):
+    with open(psg_path, 'rb') as f:
+        d = bytearray(f.read())
+    arena = parse_arena(d)
+    carrier = find_carrier(d, arena)
+    bone_names, bind_rows, ibm_rows = read_bones_from_carrier(d, carrier)
+    palette = read_palette(d, arena, len(bone_names))
+    base, _subs = pair_streams_and_decode(d, arena)
+    if base is None:
+        raise RuntimeError("No drawable submesh (with indices+weights) found.")
+    positions, normals, tangents, binormals, uvs, faces, skin_indices, skin_weights = build_geometry_and_skin(d, base, palette)
+
+    # ---- Armature (fresh) ----
+    if ARMATURE_NAME in bpy.data.objects:
+        bpy.data.objects.remove(bpy.data.objects[ARMATURE_NAME], do_unlink=True)
+    if ARMATURE_NAME in bpy.data.armatures:
+        bpy.data.armatures.remove(bpy.data.armatures[ARMATURE_NAME], do_unlink=True)
+
+    arm = bpy.data.armatures.new(ARMATURE_NAME)
+    arm_obj = bpy.data.objects.new(ARMATURE_NAME, arm)
+    if MAKE_COLLECTION:
+        coll = bpy.data.collections.get("PSG_Import") or bpy.data.collections.new("PSG_Import")
+        if "PSG_Import" not in bpy.context.scene.collection.children:
+            bpy.context.scene.collection.children.link(coll)
+        coll.objects.link(arm_obj)
+    else:
+        bpy.context.collection.objects.link(arm_obj)
+    bpy.context.view_layer.objects.active = arm_obj
+
+    bpy.ops.object.mode_set(mode='EDIT')
+    by_name={}
+    xinfo={}
+    heads_preview=[]
+
+    # Create bones (pass 1): head + provisional tail + roll align to local +X
+    for name, rows in zip(bone_names, bind_rows):
+        head, rot3 = expert_decompose_row_major(rows)
+        z_axis = rot3 @ Vector((0,0,1))
+        if z_axis.length <= 1e-8: z_axis = Vector((0,0,1))
+        z_axis.normalize()
+        eb = arm.edit_bones.new(name)
+        eb.head = head
+        eb.tail = head + z_axis * 0.1
+        x_axis = rot3 @ Vector((1,0,0))
+        if x_axis.length > 1e-8:
+            eb.align_roll(x_axis.normalized())
+        by_name[name]=eb
+        xinfo[name]={'head':head, 'rot3':rot3}
+        heads_preview.append(head)
+
+    default_len = compute_default_bone_length(heads_preview)
+
+    # Parenting (pass 2): mapping first, then auto-parent + nearest fallback
+    norm_to_real = { _norm(n): n for n in by_name.keys() }
+    def _real(n): return norm_to_real.get(_norm(n))
+
+    # declared parents
+    for child_name, parent_name in bone_hierarchy.items():
+        rc = _real(child_name)
+        if not rc: continue
+        c = by_name[rc]
+        if parent_name:
+            rp = _real(parent_name)
+            if rp: c.parent = by_name[rp]
+        else:
+            c.parent = None
+
+    # explicit roots to preserve
+    explicit_root_reals = { _real(n) for n,p in bone_hierarchy.items() if p is None and _real(n) }
+
+    def _side(u):
+        if "LEFT" in u: return "L"
+        if "RIGHT" in u: return "R"
+        return None
+    def _guess_parent_name(u):
+        if u in {"EYELIDS","EYEBROW","MOUTH","HEADEND"}: return _real("HEAD") or _real("NECK1") or _real("NECK")
+        if u.endswith("THUMB"):
+            s=_side(u)
+            if s=="L": return _real("LEFTHAND")
+            if s=="R": return _real("RIGHTHAND")
+        if "TOE" in u:
+            s=_side(u)
+            if s=="L": return _real("LEFTFOOT")
+            if s=="R": return _real("RIGHTFOOT")
+        if "HAND" in u:
+            s=_side(u)
+            if s=="L": return _real("LEFTHAND")
+            if s=="R": return _real("RIGHTHAND")
+        if any(tok in u for tok in ("JAW","EYE","FACE","HEAD")): return _real("HEAD")
+        return None
+
+    names_iter=list(by_name.keys())
+    for name in names_iter:
+        eb = by_name[name]
+        if eb.parent is not None: continue
+        if name in explicit_root_reals: continue
+        u = _norm(name)
+        gp = _guess_parent_name(u)
+        if gp and gp in by_name and gp != name:
+            eb.parent = by_name[gp]
+            continue
+        # nearest fallback
+        h = xinfo[name]['head']
+        nearest=None; best=1e30
+        for other in names_iter:
+            if other==name: continue
+            so = _side(_norm(other)); sn = _side(u)
+            if sn and so and sn != so: continue
+            d = (xinfo[other]['head'] - h).length
+            if d < best: best=d; nearest=other
+        if nearest: eb.parent = by_name[nearest]
+
+    # Build parent→children map
+    parent_to_children={}
+    for n, eb in by_name.items():
+        if eb.parent:
+            parent_to_children.setdefault(eb.parent.name, []).append(n)
+
+    def _is_helper(n:str)->bool:
+        u=_norm(n)
+        return any(tok in u for tok in ("TWIST","HLP","HELP","OFFSET"))
+
+    def _primary_child(parent_name:str):
+        kids = parent_to_children.get(parent_name, [])
+        core = [k for k in kids if not _is_helper(k)]
+        cand = core if core else kids
+        if not cand: return None
+        hp = xinfo[parent_name]['head']
+        return min(cand, key=lambda k: (xinfo[k]['head'] - hp).length)
+
+    # Tails (pass 3): direction = local +X; length = dist to primary child (fallback to default)
+    for name, eb in by_name.items():
+        head = xinfo[name]['head']
+        rot3 = xinfo[name]['rot3']
+        forward = rot3 @ Vector((1,0,0))
+        if forward.length <= 1e-8: forward = Vector((0,0,1))
+        else: forward.normalize()
+        child = _primary_child(name)
+        length = 0.0
+        if child and child in xinfo:
+            length = (xinfo[child]['head'] - head).length
+        if length <= 1e-6:
+            length = max(0.5 * default_len, 0.01)
+        eb.tail = head + forward * length
+
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # ---- Mesh object ----
+    mesh = bpy.data.meshes.new(MESH_NAME)
+    obj = bpy.data.objects.new(MESH_NAME, mesh)
+    if MAKE_COLLECTION:
+        coll = bpy.data.collections.get("PSG_Import") or bpy.data.collections.new("PSG_Import")
+        if "PSG_Import" not in bpy.context.scene.collection.children:
+            bpy.context.scene.collection.children.link(coll)
+        coll.objects.link(obj)
+    else:
+        bpy.context.collection.objects.link(obj)
+
+    # Create geometry
+    mesh.from_pydata([tuple(p) for p in positions], [], faces)
+    mesh.update()
+
+    # UVs
+    if uvs:
+        uv_layer = mesh.uv_layers.new(name="UV0")
+        uv_data = uv_layer.data
+        # Smooth shading for Blender 4.x (no use_auto_smooth)
+        if len(mesh.polygons):
+            mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+        # Assign per-loop UVs
+        loop_idx = 0
+        for poly in mesh.polygons:
+            for li in poly.loop_indices:
+                vi = mesh.loops[li].vertex_index
+                u,v = uvs[vi]
+                uv_data[loop_idx].uv = (u, v)
+                loop_idx += 1
+
+    # Custom normals
+    if normals and len(normals) == len(mesh.vertices):
+        # Blender 4.x: directly set per-loop normals; no create/free API and no use_auto_smooth
+        loop_normals = [tuple(normals[l.vertex_index]) for l in mesh.loops]
+        if loop_normals:
+            mesh.normals_split_custom_set(loop_normals)
+        mesh.update()
+
+    # Store tangents/binormals as attributes
+    if tangents and len(tangents) == len(mesh.vertices):
+        attr_tan = mesh.attributes.new(name="tangent", type='FLOAT_VECTOR', domain='POINT')
+        attr_tan.data.foreach_set("vector", [c for v in tangents for c in (v.x, v.y, v.z)])
+    if binormals and len(binormals) == len(mesh.vertices):
+        attr_bin = mesh.attributes.new(name="binormal", type='FLOAT_VECTOR', domain='POINT')
+        attr_bin.data.foreach_set("vector", [c for v in binormals for c in (v.x, v.y, v.z)])
+
+    # Bake mesh S16 scale and rotate +90° about X (mesh)
+    obj.rotation_euler = (math.radians(90.0), 0.0, 0.0)
+    obj.scale = (S16_SCALE, S16_SCALE, S16_SCALE)
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    try:
+        arm_obj.select_set(False)
+    except Exception:
+        pass
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+
+    # Armature modifier
+    if obj.modifiers.get("Armature"):
+        obj.modifiers.remove(obj.modifiers["Armature"])
+    arm_mod = obj.modifiers.new(name='Armature', type='ARMATURE')
+    arm_mod.object = arm_obj
+
+    # Ensure vertex groups for ALL bones
+    for n in bone_names:
+        if obj.vertex_groups.get(n) is None:
+            obj.vertex_groups.new(name=n)
+
+    # Bind skin
+    nv = len(mesh.vertices)
+    limit = min(nv, len(skin_indices))
+    for vi in range(limit):
+        idx = skin_indices[vi]; w = skin_weights[vi]
+        s = max(1e-8, w[0]+w[1]+w[2]+w[3])
+        for j in range(4):
+            gi = idx[j]; ww = w[j]/s
+            if ww <= 0.0 or gi < 0 or gi >= len(bone_names):
+                continue
+            vg = obj.vertex_groups.get(bone_names[gi])
+            if vg: vg.add([vi], ww, 'REPLACE')
+
+    # Select and report
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    arm_obj.select_set(True)
+    print(f"[Done] Bones={len(bone_names)}  Verts={len(mesh.vertices)}  Faces={len(mesh.polygons)}  Scale(S16)={S16_SCALE}")
+    return obj, arm_obj
+
+# ====== Entry ======
+if PSG_PATH and os.path.isfile(PSG_PATH):
+    run_import(PSG_PATH)
+else:
+    raise FileNotFoundError(f"Set PSG_PATH to a valid file. Current: {PSG_PATH}")
